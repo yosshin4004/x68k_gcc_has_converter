@@ -4,11 +4,12 @@
 # 解説
 
 x68k_gcc_has_converter は、
-m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した gcc）が生成するアセンブラソースを、
+m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した gcc）が生成する gas 形式のアセンブラソースを、
 X68K で広く利用されたアセンブラである HAS.X (X68K High-speed Assembler by Y.Nakamura(YuNK)) が処理可能な形式に変換するツールです。
 
 本ツールを利用することで、最新の gcc でクロスコンパイルしたコードを X68K のオブジェクトファイル形式に変換し、
-過去のソフトウェア資産（例えば Sharp XC コンパイラに含まれるライブラリ群）とリンクすることが可能になります。
+過去のソフトウェア資産（例えば SHARP XC コンパイラに含まれるライブラリ群など）とリンクすることが可能になります。
+
 
 # 利用例
 
@@ -20,10 +21,10 @@ X68K で広く利用されたアセンブラである HAS.X (X68K High-speed Ass
 ```bash
 # example.c をコンパイルする。
 # X68K と ABI を一致させるため d2 a2 を破壊可能レジスタとして指定する。
-m68k-elf-gcc example.c -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gcc_asm.s
+m68k-elf-gcc example.c -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gas.s
 
 # HAS.X が処理可能なフォーマットに変換する。
-perl x68k_gcc_has_converter.pl -i example.m68k_gcc_asm.s -o example.s
+perl x68k_gcc_has_converter.pl -i example.m68k_gas.s -o example.s
 ```
 カレントディレクトリに example.s が得られます。
 
@@ -44,10 +45,10 @@ HAS.X -e -u -w 0 -o example.o example.s
 # HAS.X 形式変換例
 
 HAS.X 形式に変換したアセンブラソースの例を示します。
-変換後の各行には、コメントで m68k-elf-gcc が生成した元ソースが記載されています。
+変換後の各行には、コメントで m68k-elf-gcc が生成した gas 形式の元ソースが記載されています。
 
-gcc の出力では movem 命令のレジスタマスクが #7952 のような数値になっていますが、
-HAS.X 形式では d3/d4/d5/d6/d7/a3 のようなレジスタリストになっています。
+次に示すように、gas 形式では movem 命令のレジスタマスクが #7952 のような数値になっていますが、
+HAS.X 形式では d3/d4/d5/d6/d7/a3 のような可読性のあるレジスタリスト表記になります。
 
 ```
 * NO_APP
@@ -81,8 +82,8 @@ _adler32_combine_:                                      *adler32_combine_:
 ```
 
 
-gcc の出力では char 型配列はエスケープシーケンスと 8 進数エンコード混在となります。
-HAS.X 形式では素直な 16 進数二桁の配列となります。
+また次に示すように、char 型配列は gas 形式では可読性の悪いエスケープシーケンスと 8 進数エンコード混在表記となりますが、
+HAS.X 形式では素直な 16 進数二桁の配列表記となります。
 
 ```
         .globl __length_code                            *       .globl  _length_code
@@ -130,7 +131,7 @@ __length_code:                                          *_length_code:
 # 補足：m68k-elf-gcc の作成方法
 
 m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した gcc）は、以下の手順で作成可能です。
-POSIX 環境上で実行してください（Linux 推奨。msys では完走できない。他環境は未テスト）。
+（POSIX 環境必須。Linux 推奨。msys では完走できない。他環境は未テスト）。
 
 
 >:warning:
