@@ -378,9 +378,11 @@ sub apply_converter {
 			#		jvs		jpl		jmi		jge		jlt		jgt		jle
 			#		jra
 			#	HAS
-			#		bhi		bls		bcc		bcs		bne		beq		bvc
-			#		bvs		bpl		bmi		bge		blt		bgt		ble
-			#		bra
+			#		jbhi	jbls	jbcc	jbcs	jbne	jbeq	jbvc
+			#		jbvs	jbpl	jbmi	jbge	jblt	jbgt	jble
+			#		jbra
+			#
+			# HAS では、jcc と bcc を自動選択できる jbcc が使える。
 			elsif ($line =~ /^\s+j(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le|ra)\s+(.*)/) {
 				my $condition	= $1;
 				my $dst			= $2;
@@ -422,8 +424,11 @@ sub apply_converter {
 		# レジスタの表記を修正
 		#	m68k_gcc
 		#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr
+		#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の ix として出現する）
+		
 		#	HAS
 		#		d0-d7 a0-a7 sp a6 ccr sr
+		#		d0.l d1.w d2.b
 		$modified =~ s/%(d[0-7])\:(b|w|l)/\1.\2/g;
 		$modified =~ s/%(a[0-7])\:(b|w|l)/\1.\2/g;
 		$modified =~ s/%(d[0-7])/\1/g;
