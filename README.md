@@ -15,7 +15,7 @@ X68K で広く利用されたアセンブラである HAS.X (X68K High-speed Ass
 
 例として、example.c を X68K のオブジェクトファイルに変換する手順を示します。
 
-以下を POSIX 環境上（Linux 等）で実行します。
+POSIX 環境上（Linux 等）で、以下のコマンドを実行します。
 （クロスコンパイラである m68k-elf-gcc の生成手順は後述します。）
 
 ```bash
@@ -26,7 +26,7 @@ m68k-elf-gcc example.c -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m
 # HAS.X が処理可能なフォーマットに変換する。
 perl x68k_gcc_has_converter.pl -i example.m68k_gas.s -o example.s
 ```
-カレントディレクトリに example.s が得られます。
+カレントディレクトリに、HAS.X 形式の example.s が得られます。
 
 続いて、以下を X68K 上で実行します。
 ```bat
@@ -131,7 +131,7 @@ __length_code:                                          *_length_code:
 # 補足：m68k-elf-gcc の作成方法
 
 m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した gcc）は、以下の手順で作成可能です。
-（POSIX 環境必須。Linux 推奨。msys では完走できない。他環境は未テスト）。
+（POSIX 環境必須。Linux 推奨。msys では完走できない。他環境は未テスト。）
 
 
 >:warning:
