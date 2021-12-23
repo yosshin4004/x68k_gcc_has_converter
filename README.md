@@ -18,17 +18,18 @@ X68K で広く利用されたアセンブラである HAS.X (X68K High-speed Ass
 （クロスコンパイラである m68k-elf-gcc の生成手順は後述します。）
 
 ```bash
-# example.c をコンパイル。
-# X68K と ABI を一致させるため d2 a2 を破壊可能レジスタとして指定。
+# example.c をコンパイルする。
+# X68K と ABI を一致させるため d2 a2 を破壊可能レジスタとして指定する。
 m68k-elf-gcc example.c -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gcc_asm.s
 
-# HAS.X が入力可能なフォーマットに変換
+# HAS.X が処理可能なフォーマットに変換する。
 perl x68k_gcc_has_converter.pl -i example.m68k_gcc_asm.s -o example.s
 ```
+カレントディレクトリに example.s が得られます。
 
-次に以下を X68K 上で実行します。
+続いて、以下を X68K 上で実行します。
 ```bat
-rem HAS.X を実行し、X68K のオブジェクトファイルに変換。
+rem HAS.X を実行し、X68K のオブジェクトファイルに変換する。
 rem -u : 未定義シンボルを外部参照にする 
 rem -e : 外部参照オフセットをロングワードにする 
 rem -w 0 : 警告の抑制
