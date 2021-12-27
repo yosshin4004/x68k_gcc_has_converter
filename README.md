@@ -25,8 +25,10 @@ POSIX 環境上（Linux 等）で、以下のコマンドを実行します。
 
 ```bash
 # example.c をコンパイルする。
-# X68K と ABI を一致させるため d2 a2 を破壊可能レジスタとして指定する。
-m68k-elf-gcc example.c -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gas.s
+# X68K と ABI を一致させるため d2 a2 を破壊可能レジスタとして指定している。
+# X68K 専用の API を認識させるため、-I オプションでそれらを定義するヘッダのパスを指定している。
+# この例では XC2102/INCLUDE に sharp XC コンパイラのヘッダが存在していると仮定している。
+m68k-elf-gcc example.c -IXC2102/INCLUDE -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gas.s
 
 # HAS.X が処理可能なフォーマットに変換する。
 perl x68k_gcc_has_converter.pl -i example.m68k_gas.s -o example.s
