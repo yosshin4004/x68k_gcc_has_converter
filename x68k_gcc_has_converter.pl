@@ -806,6 +806,21 @@ sub modify_args {
 			}
 			push(@a_modified_arg, $modified_arg);
 		}
+		# (d8,an,ix)
+		elsif (
+			$input =~ /^\(($g_regex_expression),($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
+		) {
+			$input = $` . $';
+			my $expression	= $1;
+			my $reg			= $2;
+			my $ix			= $3;
+			my $bitfield	= $4;
+			my $modified_arg = '(' . modify_expression($expression, $src_location) . ','  . $reg . ',' . $ix . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as (d8,an,ix)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
 		# d8(pc,ix)
 		elsif (
 			$input =~ /^($g_regex_expression)\(%pc,($g_regex_ix)\)($g_regex_bitfield)?/
@@ -822,7 +837,7 @@ sub modify_args {
 		}
 		# (an)
 		elsif (
-			$input =~ /^\(($g_regex_an)\)/
+			$input =~ /^\(($g_regex_an)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
 			my $reg			= $1;
