@@ -50,19 +50,34 @@ my $g_regex_dec_or_hex	= '(?:\d+(?![a-zA-Z_])|0x[0-9a-fA-F]+)';
 # 数値またはラベル名または式にマッチする正規表現
 my $g_regex_expression	= '[a-zA-Z0-9_.\+\-]+';
 
+
+# 各種オペランドサイズにマッチする正規表現
+#	.b .w .l のように、ドットを使う表記だけでなく、
+#	:b :w :l のような、コロンを使う表記が出現することがある点に注意。
+my $g_regex_opsize = '[:.][bwl]';
+
 # 各種レジスタにマッチする正規表現
-my $g_regex_dn	= '%d[0-7](?:[:.][bwl])?';
-my $g_regex_an	= '(?:%a[0-7]|%fp|%sp)(?:[:.][bwl])?';
-my $g_regex_sr	= '%sr';
-my $g_regex_ccr	= '%ccr';
+#	a6 を意味する fp と fp0-fp7 は誤認識される危険があるので評価順に注意すること。
+my $g_regex_dn		= "%d[0-7](?:$g_regex_opsize)?";
+my $g_regex_an		= "(?:%a[0-7]|%fp|%sp)(?:$g_regex_opsize)?";
+my $g_regex_sr		= "%sr";
+my $g_regex_ccr		= "%ccr";
+my $g_regex_fpn		= "(?:%fp[0-7])";
+my $g_regex_fpcr	= "%fpcr";
+my $g_regex_fpsr	= "%fpsr";
+my $g_regex_fpiar	= "%fpiar";
 
 # 全レジスタにマッチする正規表現
-my $g_regex_dn_an_sr_ccr =
+my $g_regex_register =
 	"(?:"
 .	 "$g_regex_dn"
 .	"|$g_regex_an"
 .	"|$g_regex_sr"
 .	"|$g_regex_ccr"
+.	"|$g_regex_fpn"
+.	"|$g_regex_fpcr"
+.	"|$g_regex_fpsr"
+.	"|$g_regex_fpiar"
 .	")";
 
 # 引数解析～コンバータ適用
@@ -422,17 +437,23 @@ sub apply_converter {
 
 		# レジスタの表記を修正
 		#	m68k_gcc
-		#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr
+		#		%fp0-%fp7
+		#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr %fpcr %fpsr %fpiar
 		#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の ix として出現する）
 		#	HAS
-		#		d0-d7 a0-a7 sp a6 ccr sr
+		#		fp0-fp7
+		#		d0-d7 a0-a7 sp a6 ccr sr fpcr fpsr fpiar
 		#		d0.l d1.w d2.b
-		$modified =~ s/%(d[0-7])\:(b|w|l)/\1.\2/g;
-		$modified =~ s/%(a[0-7])\:(b|w|l)/\1.\2/g;
+		$modified =~ s/%(fp[0-7])/\1/g;
+		$modified =~ s/%fpcr/fpcr/g;
+		$modified =~ s/%fpsr/fpsr/g;
+		$modified =~ s/%fpiar/fpiar/g;
+		$modified =~ s/%(d[0-7])\:([bwl])/\1.\2/g;
+		$modified =~ s/%(a[0-7])\:([bwl])/\1.\2/g;
 		$modified =~ s/%(d[0-7])/\1/g;
 		$modified =~ s/%(a[0-7])/\1/g;
 		$modified =~ s/%sp/sp/g;
-		$modified =~ s/%fp/a6/g;
+		$modified =~ s/%fp/a6/g;		# 浮動小数レジスタの一部と認識されることを避けるため最後に置換する
 		$modified =~ s/%pc/pc/g;
 		$modified =~ s/%ccr/ccr/g;
 		$modified =~ s/%sr/sr/g;
@@ -550,7 +571,7 @@ sub modify_expression {
 	# 分解と修正
 	while (1) {
 		# レジスタ指定
-		if ($input =~ /^($g_regex_dn_an_sr_ccr)/) {
+		if ($input =~ /^($g_regex_register)/) {
 			$input = $` . $';
 			my $reg = $1;
 			push(@a_term, $reg);
@@ -560,7 +581,7 @@ sub modify_expression {
 		# 即値
 		#	pea 1234.w
 		#	のように、数値の後ろに .b .w .l が付加する可能性がある。
-		if ($input =~ /^($g_regex_dec_or_hex)(\.[bwl])?/) {
+		if ($input =~ /^($g_regex_dec_or_hex)($g_regex_opsize)?/) {
 			$input = $` . $';
 			my $vale = $1;
 			my $field = $2;
@@ -577,7 +598,7 @@ sub modify_expression {
 			$input = $` . $';
 			my $label = $1;
 			my $field;
-			if ($label =~ /^(.*)(\.[bwl])$/) {
+			if ($label =~ /^(.*)($g_regex_opsize)$/) {
 				$label = $1;
 				$field = $2;
 			}
@@ -646,7 +667,7 @@ sub modify_args {
 		# sr
 		# ccr
 		if (
-			$input =~ /^($g_regex_dn_an_sr_ccr)/
+			$input =~ /^($g_regex_register)/
 		) {
 			$input = $` . $';
 			my $reg = $1;
@@ -773,7 +794,7 @@ sub modify_args {
 		}
 		# 数値またはラベル名または式（括弧つき） : expression 部を $1 に格納
 		elsif (
-			$input =~ /^\(($g_regex_expression)\)([.][bwl])?/
+			$input =~ /^\(($g_regex_expression)\)($g_regex_opsize)?/
 		) {
 			$input = $` . $';
 			my $expression = $1;
