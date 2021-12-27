@@ -276,15 +276,6 @@ sub apply_converter {
 				my $label = $1;
 				$modified = '	.globl ' . modify_label($label);
 			}
-			# .local ディレクティブで指定されているラベル
-			#	m68k_gcc
-			#		.local inflateBackInit_
-			#	HAS
-			#		.xdef _inflateBackInit_
-			elsif ($line =~ /\s+\.local\s+(.*)/) {
-				my $label = $1;
-				$modified = '	.xdef ' . modify_label($label);
-			}
 			# .comm ディレクティブ
 			#	m68k_gcc
 			#			.comm	LOCTBL_TOP,16,2
@@ -326,13 +317,14 @@ sub apply_converter {
 				$modified = '	.bss';
 			}
 			# HAS が認識できないディレクティブの除去
+			#	.local		static なシンボル
 			#	.type		ラベルの用途を指定するデバッグ情報らしい
 			#	.size		詳細不明
 			#	.ident		コンパイラのバージョン情報らしい
 			#	.section	必要なものは個別に認識済み
 			#	.swbeg		詳細不明
 			#	.cfi_...	デバッグ情報らしい
-			elsif ($line =~ /^\s+\.(type\s+|size\s+|ident\s+|section\s+|swbeg\s+|cfi_\w+\s+)/) {
+			elsif ($line =~ /^\s+\.(local\s+|type\s+|size\s+|ident\s+|section\s+|swbeg\s+|cfi_\w+\s+)/) {
 			}
 			# アライメントの指定を修正
 			#	m68k_gcc
