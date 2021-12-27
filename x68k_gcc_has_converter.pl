@@ -42,6 +42,11 @@ use constant {
     EXIT_FAILURE => 1,
 };
 
+# 10 進数または 16 進数にマッチする正規表現
+#	16 進数冒頭の 0x が 10 進数の一部と認識されること等を避けるため、
+#	後続が a-zA-Z_ でない場合のみ 10 進数と判定している。
+my $g_regex_dec_or_hex	= '(?:\d+(?![a-zA-Z_])|0x[0-9a-fA-F]+)';
+
 # 数値またはラベル名または式にマッチする正規表現
 my $g_regex_expression	= '[a-zA-Z0-9_.\+\-]+';
 
@@ -203,7 +208,6 @@ sub apply_converter {
 		#
 		# 行頭から始まり : で終わる文字列をラベルと認識する。
 		if ($line =~ /^([a-zA-Z_?.].*)\:/) {
-			# 置換ルール登録
 			my $label = $1;
 			$modified = modify_label($label) . ':';
 		}
@@ -211,13 +215,13 @@ sub apply_converter {
 		elsif ($line =~ /^\s+\./) {
 			# バイナリ埋め込みの修正
 			#	m68k_gcc
-			#		.long	123
-			#		.word	123
-			#		.byte	123
+			#		.long	123, ...
+			#		.word	123, ...
+			#		.byte	123, ...
 			#	HAS
-			#		.dc.l	123
-			#		.dc.w	123
-			#		.dc.b	123
+			#		.dc.l	123, ...
+			#		.dc.w	123, ...
+			#		.dc.b	123, ...
 			if ($line =~ /^\s+\.long\s+(.*)/) {
 				my $param = $1;
 				$modified = '	.dc.l ' . modify_args($param);
@@ -254,7 +258,6 @@ sub apply_converter {
 			#	HAS
 			#		.globl _inflateBackInit_
 			elsif ($line =~ /\s+\.globl\s+(.*)/) {
-				# 置換ルール登録
 				my $label = $1;
 				$modified = '	.globl ' . modify_label($label);
 			}
@@ -264,7 +267,6 @@ sub apply_converter {
 			#	HAS
 			#		.xdef _inflateBackInit_
 			elsif ($line =~ /\s+\.local\s+(.*)/) {
-				# 置換ルール登録
 				my $label = $1;
 				$modified = '	.xdef ' . modify_label($label);
 			}
@@ -273,8 +275,7 @@ sub apply_converter {
 			#			.comm	LOCTBL_TOP,16,2
 			#	HAS
 			#			.comm	LOCTBL_TOP,16
-			elsif ($line =~ /\s+\.comm\s+(.*),(\d+),(\d+)/) {
-				# 置換ルール登録
+			elsif ($line =~ /\s+\.comm\s+(.*),($g_regex_dec_or_hex),($g_regex_dec_or_hex)/) {
 				my $label = $1;
 				my $size  = $2;
 				my $align = $3;
@@ -287,8 +288,7 @@ sub apply_converter {
 			#		.zero	123
 			#	HAS
 			#		.ds.b	16
-			elsif ($line =~ /\s+\.zero\s+(\d+)/) {
-				# 置換ルール登録
+			elsif ($line =~ /\s+\.zero\s+($g_regex_dec_or_hex)/) {
 				my $size = $1;
 				$modified = '	.ds.b ' . $size;
 			}
@@ -300,7 +300,6 @@ sub apply_converter {
 			#	HAS
 			#		.data
 			elsif ($line =~ /\s+\.section\s+\.rodata/) {
-				# 置換ルール登録
 				$modified = '	.data';
 			}
 			# BSS セクション
@@ -309,16 +308,16 @@ sub apply_converter {
 			#	HAS
 			#		.bss
 			elsif ($line =~ /\s+\.section\s+\.bss/) {
-				# 置換ルール登録
 				$modified = '	.bss';
 			}
 			# HAS が認識できないディレクティブの除去
-			#	.type
-			#	.size
-			#	.ident
-			#	.section
-			#	.swbeg
-			elsif ($line =~ /^\s+\.(type|size|ident|section|swbeg)\s+(.*)/) {
+			#	.type		ラベルの用途を指定するデバッグ情報らしい
+			#	.size		詳細不明
+			#	.ident		コンパイラのバージョン情報らしい
+			#	.section	必要なものは個別に認識済み
+			#	.swbeg		詳細不明
+			#	.cfi_...	デバッグ情報らしい
+			elsif ($line =~ /^\s+\.(type\s+|size\s+|ident\s+|section\s+|swbeg\s+|cfi_\w+\s+)/) {
 			}
 			# アライメントの指定を修正
 			#	m68k_gcc
@@ -329,7 +328,7 @@ sub apply_converter {
 			# m68k_gcc では、アライメントで発生するパディングの値を
 			# 指定できるようだが、該当する機能が HAS には存在しない。
 			# .align で代用する。
-			elsif ($line =~ /^\s+\.balignw\s+(\d+),(.*)/) {
+			elsif ($line =~ /^\s+\.balignw\s+($g_regex_dec_or_hex),(.*)/) {
 				my $align = $1;
 				my $padding = $2;
 				$modified = '	.align ' . $align;
@@ -344,7 +343,7 @@ sub apply_converter {
 			#		movem.l #15360,(sp)
 			#	HAS
 			#		movem.l d3/d4/d5/a3/a4,(sp)
-			if ($line =~ /(^\s+movem\.\w)\s+\#(\d+),([^-].*)/) {
+			if ($line =~ /(^\s+movem\.\w)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -355,7 +354,7 @@ sub apply_converter {
 			#		movem.l #15360,-(sp)
 			#	HAS
 			#		movem.l d3/d4/d5/a3/a4,-(sp)
-			elsif ($line =~ /(^\s+movem\.\w)\s+\#(\d+),(-.*)/) {
+			elsif ($line =~ /(^\s+movem\.\w)\s+\#($g_regex_dec_or_hex),(-.*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -366,7 +365,7 @@ sub apply_converter {
 			#		movem.l (sp)+,#1148
 			#	HAS
 			#		movem.l (sp)+,d2/d3/d4/d5/d6/a2
-			elsif ($line =~ /(^\s+movem\.\w)\s+(.*),\#(\d+)/) {
+			elsif ($line =~ /(^\s+movem\.\w)\s+(.*),\#($g_regex_dec_or_hex)/) {
 				my $op		= $1;
 				my $src		= $2;
 				my $mask	= $3;
@@ -425,7 +424,6 @@ sub apply_converter {
 		#	m68k_gcc
 		#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr
 		#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の ix として出現する）
-		
 		#	HAS
 		#		d0-d7 a0-a7 sp a6 ccr sr
 		#		d0.l d1.w d2.b
@@ -562,7 +560,7 @@ sub modify_expression {
 		# 即値
 		#	pea 1234.w
 		#	のように、数値の後ろに .b .w .l が付加する可能性がある。
-		if ($input =~ /^(\d+)(\.[bwl])?/) {
+		if ($input =~ /^($g_regex_dec_or_hex)(\.[bwl])?/) {
 			$input = $` . $';
 			my $vale = $1;
 			my $field = $2;
@@ -887,7 +885,7 @@ sub decode_escape_sequence {
 			elsif ($chars[$i + 1] eq 'f') { push(@decoded, '$0c'); $i += 1; }
 			elsif ($chars[$i + 1] eq 'r') { push(@decoded, '$0d'); $i += 1; }
 			elsif ($chars[$i + 1] eq '\\'){ push(@decoded, '$5c'); $i += 1; }
-			# ３桁8進数エンコード
+			# 3桁8進数エンコード
 			elsif ('0' <= $chars[$i + 1] && $chars[$i + 1] <= '9') {
 				push(@decoded, '$' . sprintf("%02x", oct($chars[$i + 1] . $chars[$i + 2] . $chars[$i + 3])));
 				$i += 3;
