@@ -38,17 +38,18 @@ use IO::File;
 
 # 定数の定義
 use constant {
-    EXIT_SUCCESS => 0,
-    EXIT_FAILURE => 1,
+    EXIT_SUCCESS	=> 0,
+    EXIT_FAILURE	=> 1,
+	DEBUG	 		=> 0,	# 0 or 1
 };
 
 # 10 進数または 16 進数にマッチする正規表現
 #	16 進数冒頭の 0x が 10 進数の一部と認識されること等を避けるため、
 #	後続が a-zA-Z_ でない場合のみ 10 進数と判定している。
-my $g_regex_dec_or_hex	= '(?:\d+(?![a-zA-Z_])|0x[0-9a-fA-F]+)';
+my $g_regex_dec_or_hex	= '(?:\\d+(?![a-zA-Z_])|0x[0-9a-fA-F]+)';
 
 # 数値またはラベル名または式にマッチする正規表現
-my $g_regex_expression	= '[a-zA-Z0-9_.\+\-]+';
+my $g_regex_expression	= '[a-zA-Z0-9_.\\+\\-]+';
 
 
 # 各種オペランドサイズにマッチする正規表現
@@ -56,28 +57,54 @@ my $g_regex_expression	= '[a-zA-Z0-9_.\+\-]+';
 #	:b :w :l のような、コロンを使う表記が出現することがある点に注意。
 my $g_regex_opsize = '[:.][bwl]';
 
+# ビットフィールド（-m68030 指定時に出現）にマッチする正規表現
+#	例:
+#		{1:2}
+#		{#1:#2}
+#	参考:
+#		https://stdkmd.net/bitfield/
+my $g_regex_bitfield = '\\{(?:\\#)?\\d+\\:(?:\\#)?\\d+\\}';
+
 # 各種レジスタにマッチする正規表現
 #	a6 を意味する fp と fp0-fp7 は誤認識される危険があるので評価順に注意すること。
-my $g_regex_dn		= "%d[0-7](?:$g_regex_opsize)?";
-my $g_regex_an		= "(?:%a[0-7]|%fp|%sp)(?:$g_regex_opsize)?";
-my $g_regex_sr		= "%sr";
-my $g_regex_ccr		= "%ccr";
+#	参考:
+#		http://yamatyuu.net/computer/68000/index.html
+my $g_regex_dn		= "%d[0-7](?:$g_regex_opsize)?(?:$g_regex_bitfield)?";
+my $g_regex_an		= "(?:%a[0-7]|%fp|%sp)(?:$g_regex_opsize)?(?:$g_regex_bitfield)?";
+my $g_regex_sr		= "%sr(?:$g_regex_bitfield)?";
+my $g_regex_ccr		= "%ccr(?:$g_regex_bitfield)?";
 my $g_regex_fpn		= "(?:%fp[0-7])";
-my $g_regex_fpcr	= "%fpcr";
-my $g_regex_fpsr	= "%fpsr";
-my $g_regex_fpiar	= "%fpiar";
+my $g_regex_fpcr	= "%fpcr(?:$g_regex_bitfield)?";
+my $g_regex_fpsr	= "%fpsr(?:$g_regex_bitfield)?";
+my $g_regex_fpiar	= "%fpiar(?:$g_regex_bitfield)?";
+
+# dn:dn（-m68030 指定時に出現）にマッチする正規表現
+my $g_regex_dn_dn	= "$g_regex_dn\\:$g_regex_dn";
+
+# ix にマッチする正規表現
+my $g_regex_ix =
+	"(?:"
+.		"(?:"
+.			 "$g_regex_dn"
+.			"|$g_regex_an"
+.		")"
+.		"(?:"
+.			"\\*\\d+"	# スケールの指定（-m68030 指定時に出現）
+.		")?"
+.	")";
 
 # 全レジスタにマッチする正規表現
 my $g_regex_register =
 	"(?:"
-.	 "$g_regex_dn"
-.	"|$g_regex_sr"
-.	"|$g_regex_ccr"
-.	"|$g_regex_fpn"
-.	"|$g_regex_fpcr"
-.	"|$g_regex_fpsr"
-.	"|$g_regex_fpiar"
-.	"|$g_regex_an"		# fp0-fp7 に a6 の別名の fp がマッチしてしまうので最後に評価する。
+.		 "$g_regex_dn_dn"
+.		"|$g_regex_dn"		# dn:dn にマッチしてしまうので最後に評価する。
+.		"|$g_regex_sr"
+.		"|$g_regex_ccr"
+.		"|$g_regex_fpn"
+.		"|$g_regex_fpcr"
+.		"|$g_regex_fpsr"
+.		"|$g_regex_fpiar"
+.		"|$g_regex_an"		# fp0-fp7 に a6 の別名の fp がマッチしてしまうので最後に評価する。
 .	")";
 
 # 引数解析～コンバータ適用
@@ -340,8 +367,8 @@ sub apply_converter {
 			# 指定できるようだが、該当する機能が HAS には存在しない。
 			# .align で代用する。
 			elsif ($line =~ /^\s+\.balignw\s+($g_regex_dec_or_hex),(.*)/) {
-				my $align = $1;
-				my $padding = $2;
+				my $align	= $1;
+				my $padding	= $2;
 				$modified = '	.align ' . $align;
 			}
 			# 上記いずれにも該当しないなら変更不要
@@ -656,7 +683,9 @@ sub modify_args {
 	#	例えば、(an) は (an)+ や -(an) にもマッチしてしまうので、
 	#	後から評価する必要がある。
 	my $input = $args;
-#print "args : " . $args . "\n";
+	if (DEBUG) {
+		print "args : [" . $args . "]\n";
+	}
 	for (my $i = 0; $i < 2; $i++) {
 		# 冒頭のスペースを除去
 		$input =~ s/^\s*//g;
@@ -677,135 +706,184 @@ sub modify_args {
 			$input = $` . $';
 			my $reg = $1;
 			my $modified_arg = $reg;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as register\n";
+			}
 			push(@a_modified_arg, $modified_arg);
-#print "$input -> $modified_arg\n";
 		}
-		# %pc@(2,%d0:w) : expression 部を $1 に、レジスタ指定部を $2 に格納
+		# abs(ix) : -m68030 指定時に出現
 		elsif (
-			$input =~ /^%pc@\(($g_regex_expression),($g_regex_dn|$g_regex_an)\)/
+			$input =~ /^($g_regex_expression)\(($g_regex_ix)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $reg = $2;
-			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . $reg . ')';
+			my $expression	= $1;
+			my $reg			= $2;
+			my $bitfield	= $3;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as abs(ix)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
-#print "$input -> $modified_arg\n";
 		}
-		# (an)+ : レジスタ指定部を $1 に格納
+		# %pc@(d8,ix)
+		elsif (
+			$input =~ /^%pc@\(($g_regex_expression),($g_regex_ix)\)($g_regex_bitfield)?/
+		) {
+			$input = $` . $';
+			my $expression	= $1;
+			my $ix			= $2;
+			my $bitfield	= $3;
+			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . $ix . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as %pc@(d8,ix)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# (an)+
 		elsif (
 			$input =~ /^\(($g_regex_an)\)\+/
 		) {
 			$input = $` . $';
 			my $reg = $1;
 			my $modified_arg = '(' . $reg . ')+';
+			if (DEBUG) {
+				print "	arg [$modified_arg] as (an)+\n";
+			}
 			push(@a_modified_arg, $modified_arg);
-#print "$input -> $modified_arg\n";
 		}
-		# -(an) : レジスタ指定部を $1 に格納
+		# -(an)
 		elsif (
 			$input =~ /^\-\(($g_regex_an)\)/
 		) {
 			$input = $` . $';
 			my $reg = $1;
 			my $modified_arg = '-(' . $reg . ')';
+			if (DEBUG) {
+				print "	arg [$modified_arg] as -(an)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
-#print "$input -> $modified_arg\n";
 		}
-		# d16(an) : expression 部を $1 に、レジスタ指定部を $2 に格納
+		# d16(an)
 		elsif (
-			$input =~ /^($g_regex_expression)\(($g_regex_an)\)/
+			$input =~ /^($g_regex_expression)\(($g_regex_an)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $reg = $2;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')';
-#print "$input -> $modified_arg\n";
+			my $expression	= $1;
+			my $reg			= $2;
+			my $bitfield	= $3;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as d16(an)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# (d16, an) : expression 部を $1 に、レジスタ指定部を $2 に格納
+		# (d16,an)
 		elsif (
-			$input =~ /^\(($g_regex_expression),($g_regex_an)\)/
+			$input =~ /^\(($g_regex_expression),($g_regex_an)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $reg = $2;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')';
-#print "$input -> $modified_arg\n";
+			my $expression	= $1;
+			my $reg			= $2;
+			my $bitfield	= $3;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as (d16, an)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# d8(an,ix) : expression 部を $1 に格納、レジスタ指定部を $2 に、インデクス指定部を $3 に格納
+		# d8(an,ix)
 		elsif (
-			$input =~ /^($g_regex_expression)\(($g_regex_an),($g_regex_dn|$g_regex_an)\)/
+			$input =~ /^($g_regex_expression)\(($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $reg = $2;
-			my $index = $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ',' . $index . ')';
-#print "$input -> $modified_arg\n";
+			my $expression	= $1;
+			my $reg			= $2;
+			my $ix			= $3;
+			my $bitfield	= $4;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ',' . $ix . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as d8(an,ix)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# d8(pc,ix) : expression 部を $1 に格納、インデクス指定部を $2 に格納
+		# d8(pc,ix)
 		elsif (
-			$input =~ /^($g_regex_expression)\(%pc,($g_regex_dn|$g_regex_an)\)/
+			$input =~ /^($g_regex_expression)\(%pc,($g_regex_ix)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $index = $2;
-			my $modified_arg = modify_expression($expression, $src_location) . '(%pc,' . $index . ')';
-#print "$input -> $modified_arg\n";
+			my $expression	= $1;
+			my $ix			= $2;
+			my $bitfield	= $3;
+			my $modified_arg = modify_expression($expression, $src_location) . '(%pc,' . $ix . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as d8(pc,ix)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# (an) : レジスタ指定部を $1 に格納
+		# (an)
 		elsif (
 			$input =~ /^\(($g_regex_an)\)/
 		) {
 			$input = $` . $';
-			my $reg = $1;
-			my $modified_arg = '(' . $reg . ')';
-#print "$input -> $modified_arg\n";
+			my $reg			= $1;
+			my $bitfield	= $2;
+			my $modified_arg = '(' . $reg . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as (an)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# (an,ix) : レジスタ指定部を $1 に、インデクス指定部を $2 に格納
+		# (an,ix)
 		elsif (
-			$input =~ /^\(($g_regex_an),($g_regex_dn|$g_regex_an)\)/
+			$input =~ /^\(($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $reg = $1;
-			my $index = $2;
-			my $modified_arg = '(' . $reg . ',' . $index . ')';
-#print "$input -> $modified_arg\n";
+			my $reg			= $1;
+			my $ix			= $2;
+			my $bitfield	= $3;
+			my $modified_arg = '(' . $reg . ',' . $ix . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as (an,ix)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# #imm : expression 部を $1 に格納
+		# #imm
 		elsif (
 			$input =~ /^\#($g_regex_expression)/
 		) {
 			$input = $` . $';
 			my $expression = $1;
 			my $modified_arg = '#' . modify_expression($expression, $src_location);
-#print "$input -> $modified_arg\n";
+			if (DEBUG) {
+				print "	arg [$modified_arg] as #imm\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# 数値またはラベル名または式 : expression 部を $1 に格納
+		# 数値またはラベル名または式
 		elsif (
-			$input =~ /^($g_regex_expression)/
+			$input =~ /^($g_regex_expression)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $modified_arg = modify_expression($expression, $src_location);
-#print "$input -> $modified_arg\n";
+			my $expression	= $1;
+			my $bitfield	= $2;
+			my $modified_arg = modify_expression($expression, $src_location) . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as expression\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# 数値またはラベル名または式（括弧つき） : expression 部を $1 に格納
+		# 数値またはラベル名または式（括弧つき）
 		elsif (
-			$input =~ /^\(($g_regex_expression)\)($g_regex_opsize)?/
+			$input =~ /^\(($g_regex_expression)\)($g_regex_opsize)?($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $expression = $1;
-			my $field = $2;
-			my $modified_arg = '(' . modify_expression($expression, $src_location) . $field . ')';
-#print "$input -> $modified_arg\n";
+			my $expression	= $1;
+			my $opsize		= $2;
+			my $bitfield	= $3;
+			my $modified_arg = '(' . modify_expression($expression, $src_location) . $opsize . ')' . $bitfield;
+			if (DEBUG) {
+				print "	arg [$modified_arg] as (expression)\n";
+			}
 			push(@a_modified_arg, $modified_arg);
 		}
 		# 検出できないならループを抜ける
