@@ -71,13 +71,13 @@ my $g_regex_fpiar	= "%fpiar";
 my $g_regex_register =
 	"(?:"
 .	 "$g_regex_dn"
-.	"|$g_regex_an"
 .	"|$g_regex_sr"
 .	"|$g_regex_ccr"
 .	"|$g_regex_fpn"
 .	"|$g_regex_fpcr"
 .	"|$g_regex_fpsr"
 .	"|$g_regex_fpiar"
+.	"|$g_regex_an"		# fp0-fp7 に a6 の別名の fp がマッチしてしまうので最後に評価する。
 .	")";
 
 # 引数解析～コンバータ適用
@@ -208,7 +208,11 @@ sub apply_converter {
 
 	# 入力ファイル全体を一行ずつ修正
 	my $line;
+	my $line_num;
 	while ($line = <$fh_input>) {
+		$line_num++;
+		my $src_location = $input_file_name . ':' . $line_num;
+
 		chomp($line);
 		my $orig = $line;
 
@@ -224,7 +228,7 @@ sub apply_converter {
 		# 行頭から始まり : で終わる文字列をラベルと認識する。
 		if ($line =~ /^([a-zA-Z_?.].*)\:/) {
 			my $label = $1;
-			$modified = modify_label($label) . ':';
+			$modified = modify_label($label, $src_location) . ':';
 		}
 		# ディレクティブ行？
 		elsif ($line =~ /^\s+\./) {
@@ -239,15 +243,15 @@ sub apply_converter {
 			#		.dc.b	123, ...
 			if ($line =~ /^\s+\.long\s+(.*)/) {
 				my $param = $1;
-				$modified = '	.dc.l ' . modify_args($param);
+				$modified = '	.dc.l ' . modify_args($param, $src_location);
 			}
 			elsif ($line =~ /^\s+\.word\s+(.*)/) {
 				my $param = $1;
-				$modified = '	.dc.w ' . modify_args($param);
+				$modified = '	.dc.w ' . modify_args($param, $src_location);
 			}
 			elsif ($line =~ /^\s+\.byte\s+(.*)/) {
 				my $param = $1;
-				$modified = '	.dc.b ' . modify_args($param);
+				$modified = '	.dc.b ' . modify_args($param, $src_location);
 			}
 			# 文字列リテラルの修正
 			#	m68k_gcc
@@ -274,7 +278,7 @@ sub apply_converter {
 			#		.globl _inflateBackInit_
 			elsif ($line =~ /\s+\.globl\s+(.*)/) {
 				my $label = $1;
-				$modified = '	.globl ' . modify_label($label);
+				$modified = '	.globl ' . modify_label($label, $src_location);
 			}
 			# .comm ディレクティブ
 			#	m68k_gcc
@@ -287,7 +291,7 @@ sub apply_converter {
 				my $align = $3;
 				$modified =
 					'	.align ' . $align . "\n"
-				.	'	.comm ' . modify_label($label) . ',' . $size;
+				.	'	.comm ' . modify_label($label, $src_location) . ',' . $size;
 			}
 			# .zero ディレクティブ
 			#	m68k_gcc
@@ -392,7 +396,7 @@ sub apply_converter {
 			elsif ($line =~ /^\s+j(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le|ra)\s+(.*)/) {
 				my $condition	= $1;
 				my $dst			= $2;
-				$modified = '	jb' . $condition . ' ' . modify_args($dst);
+				$modified = '	jb' . $condition . ' ' . modify_args($dst, $src_location);
 			}
 			# jsr 命令
 			#	m68k_gcc
@@ -403,7 +407,7 @@ sub apply_converter {
 			# HAS では、jsr と bsr を自動選択できる jbsr が使える。
 			elsif ($line =~ /^\s+jsr\s+(.*)/) {
 				my $dst = $1;
-				$modified = '	jbsr ' . modify_args($dst);
+				$modified = '	jbsr ' . modify_args($dst, $src_location);
 			}
 			# その他の命令
 			#
@@ -411,7 +415,7 @@ sub apply_converter {
 			elsif ($line =~ /^\s+(.+)\s+(.*)$/) {
 				my $op		= $1;
 				my $args	= $2;
-				$modified = '	' . $op . ' ' . modify_args($args);
+				$modified = '	' . $op . ' ' . modify_args($args, $src_location);
 			}
 			# 冒頭の定型句の修正
 			elsif ($line =~ /^#NO_APP$/) {
@@ -530,12 +534,16 @@ sub convert_movem_mask_to_reg_list {
 #		・$label
 #			ラベル
 #
+#		・$src_location
+#			ソースの位置情報
+#
 #	[return]
 #		HAS スタイルのラベル
 #------------------------------------------------------------------------------
 sub modify_label {
 	my (
-		$label
+		$label,
+		$src_location
 	) = @_;
 	$label =~ s/\./\?/g;
 	return '_' . $label;
@@ -549,12 +557,16 @@ sub modify_label {
 #		・$expression
 #			ラベル交じりの式
 #
+#		・$src_location
+#			ソースの位置情報
+#
 #	[return]
 #		HAS スタイルの式
 #------------------------------------------------------------------------------
 sub modify_expression {
 	my (
-		$expression
+		$expression,
+		$src_location
 	) = @_;
 
 	my $input = $expression;
@@ -594,7 +606,7 @@ sub modify_expression {
 				$label = $1;
 				$field = $2;
 			}
-			push(@a_term, modify_label($label) . $field);
+			push(@a_term, modify_label($label, $src_location) . $field);
 			next;
 		}
 
@@ -611,7 +623,7 @@ sub modify_expression {
 		}
 
 		# ここまでたどり着いたらエラー
-		die("ERROR : modify_expression failed to parse [$expression].\n");
+		die("$src_location: ERROR: modify_expression failed to parse [$expression].\n");
 	}
 
 	# 再結合
@@ -626,12 +638,16 @@ sub modify_expression {
 #		・$args
 #			数式交じりの引数リスト
 #
+#		・$src_location
+#			ソースの位置情報
+#
 #	[return]
 #		HAS スタイルの引数リスト
 #------------------------------------------------------------------------------
 sub modify_args {
 	my (
-		$args
+		$args,
+		$src_location
 	) = @_;
 	my @a_modified_arg;
 
@@ -649,15 +665,12 @@ sub modify_args {
 		if ($i != 0) {
 			if ($input ne '') {
 				if (!($input =~ s/^,//g)) {
-					die("ERROR : modify_args failed to parse [$args].\n");
+					die("$src_location: ERROR: modify_args failed to parse [$args].\n");
 				}
 			}
 		}
 
-		# d0-d7
-		# a0-a7 fp sp
-		# sr
-		# ccr
+		# レジスタ
 		if (
 			$input =~ /^($g_regex_register)/
 		) {
@@ -674,7 +687,7 @@ sub modify_args {
 			$input = $` . $';
 			my $expression = $1;
 			my $reg = $2;
-			my $modified_arg = modify_expression($expression) . '(pc,' . $reg . ')';
+			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . $reg . ')';
 			push(@a_modified_arg, $modified_arg);
 #print "$input -> $modified_arg\n";
 		}
@@ -705,7 +718,7 @@ sub modify_args {
 			$input = $` . $';
 			my $expression = $1;
 			my $reg = $2;
-			my $modified_arg = modify_expression($expression) . '(' . $reg . ')';
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')';
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -716,7 +729,7 @@ sub modify_args {
 			$input = $` . $';
 			my $expression = $1;
 			my $reg = $2;
-			my $modified_arg = modify_expression($expression) . '(' . $reg . ')';
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')';
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -728,7 +741,7 @@ sub modify_args {
 			my $expression = $1;
 			my $reg = $2;
 			my $index = $3;
-			my $modified_arg = modify_expression($expression) . '(' . $reg . ',' . $index . ')';
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ',' . $index . ')';
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -739,7 +752,7 @@ sub modify_args {
 			$input = $` . $';
 			my $expression = $1;
 			my $index = $2;
-			my $modified_arg = modify_expression($expression) . '(%pc,' . $index . ')';
+			my $modified_arg = modify_expression($expression, $src_location) . '(%pc,' . $index . ')';
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -770,7 +783,7 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression = $1;
-			my $modified_arg = '#' . modify_expression($expression);
+			my $modified_arg = '#' . modify_expression($expression, $src_location);
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -780,7 +793,7 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression = $1;
-			my $modified_arg = modify_expression($expression);
+			my $modified_arg = modify_expression($expression, $src_location);
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -791,7 +804,7 @@ sub modify_args {
 			$input = $` . $';
 			my $expression = $1;
 			my $field = $2;
-			my $modified_arg = '(' . modify_expression($expression) . $field . ')';
+			my $modified_arg = '(' . modify_expression($expression, $src_location) . $field . ')';
 #print "$input -> $modified_arg\n";
 			push(@a_modified_arg, $modified_arg);
 		}
@@ -806,7 +819,7 @@ sub modify_args {
 
 	# すべて分解しきれていないならエラー
 	if ($input ne '') {
-		die("ERROR : modify_args failed to parse [$args].\n");
+		die("$src_location: ERROR: modify_args failed to parse [$args].\n");
 	}
 
 	# 修正引数リストの結合
