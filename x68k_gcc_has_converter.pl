@@ -246,6 +246,27 @@ sub apply_converter {
 		# 修正結果の生成先
 		my $modified;
 
+		# 空行？
+		if    ($line =~ /^\s*$/) {
+			$modified = $line;
+		}
+		# * コメント行？
+		elsif ($line =~ /^\s*\*/) {
+			$modified = $line;
+		}
+		# # コメント行？
+		elsif ($line =~ /^\s*\#/) {
+			# 冒頭の定型句の修正
+			if ($line =~ /^#NO_APP$/) {
+				$modified = '* NO_APP'
+					."\n".	'RUNS_HUMAN_VERSION	equ	3'
+					."\n".	'	.cpu ' . $cpu_type
+					."\n".	'* X68 GCC Develop'
+					."\n";
+			} else {
+				$modified = $line;
+			}
+		}
 		# ラベル行？
 		#	m68k_gcc
 		#		abc:
@@ -253,7 +274,7 @@ sub apply_converter {
 		#		_abc:
 		#
 		# 行頭から始まり : で終わる文字列をラベルと認識する。
-		if ($line =~ /^([a-zA-Z_?.].*)\:/) {
+		elsif ($line =~ /^([a-zA-Z_?.].*)\:/) {
 			my $label = $1;
 			$modified = modify_label($label, $src_location) . ':';
 		}
@@ -378,10 +399,10 @@ sub apply_converter {
 		} else {
 			# movem 命令（制御・可変モード）のレジスタ指定
 			#	m68k_gcc
-			#		movem.l #15360,(sp)
+			#		movem.l #15360,<ea>
 			#	HAS
-			#		movem.l d3/d4/d5/a3/a4,(sp)
-			if ($line =~ /(^\s+movem\.\w)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
+			#		movem.l d3/d4/d5/a3/a4,<ea>
+			if ($line =~ /(^\s+movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -389,10 +410,10 @@ sub apply_converter {
 			}
 			# movem 命令（プレデクリメントモード）のレジスタ指定
 			#	m68k_gcc
-			#		movem.l #15360,-(sp)
+			#		movem.l #15360,-(an)
 			#	HAS
-			#		movem.l d3/d4/d5/a3/a4,-(sp)
-			elsif ($line =~ /(^\s+movem\.\w)\s+\#($g_regex_dec_or_hex),(-.*)/) {
+			#		movem.l d3/d4/d5/a3/a4,-(an)
+			elsif ($line =~ /(^\s+movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -400,14 +421,53 @@ sub apply_converter {
 			}
 			# movem 命令のレジスタ指定
 			#	m68k_gcc
-			#		movem.l (sp)+,#1148
+			#		movem.l <ea>,#1148
 			#	HAS
-			#		movem.l (sp)+,d2/d3/d4/d5/d6/a2
-			elsif ($line =~ /(^\s+movem\.\w)\s+(.*),\#($g_regex_dec_or_hex)/) {
+			#		movem.l <ea>,d2/d3/d4/d5/d6/a2
+			elsif ($line =~ /(^\s+movem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
 				my $op		= $1;
 				my $src		= $2;
 				my $mask	= $3;
 				$modified = $op . ' ' . $src . ',' . convert_movem_mask_to_reg_list($mask);
+			}
+			# fmovem 命令（制御・可変モード）のレジスタ指定
+			#	m68k_gcc
+			#		fmovem #0xfc,<ea>
+			#	HAS
+			#		fmovem fp0/fp1/fp2/fp3/fp4/fp5,<ea>
+			#
+			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
+			elsif ($line =~ /(^\s+fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
+				my $op		= $1;
+				my $mask	= $2;
+				my $dst		= $3;
+				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask)) . ',' . $dst;
+			}
+			# fmovem 命令（プレデクリメントモード）のレジスタ指定
+			#	m68k_gcc
+			#		fmovem #0x3f,-(an)
+			#	HAS
+			#		fmovem.l fp0/fp1/fp2/fp3/fp4/fp5,-(an)
+			#
+			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
+			elsif ($line =~ /(^\s+fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
+				my $op		= $1;
+				my $mask	= $2;
+				my $dst		= $3;
+				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list($mask) . ',' . $dst;
+			}
+			# fmovem 命令のレジスタ指定
+			#	m68k_gcc
+			#		fmovem.l <ea>,#0xfc
+			#	HAS
+			#		fmovem.l <ea>,fp0/fp1/fp2/fp3/fp4/fp5
+			#
+			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
+			elsif ($line =~ /(^\s+fmovem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
+				my $op		= $1;
+				my $src		= $2;
+				my $mask	= $3;
+				$modified = $op . ' ' . $src . ',' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask));
 			}
 			# jXX 命令
 			#	m68k_gcc
@@ -424,6 +484,20 @@ sub apply_converter {
 				my $condition	= $1;
 				my $dst			= $2;
 				$modified = '	jb' . $condition . ' ' . modify_args($dst, $src_location);
+			}
+			# fjXX 命令
+			#	m68k_gcc
+			#		fjhi	fjls	fjcc	fjcs	fjne	fjeq	fjvc
+			#		fjvs	fjpl	fjmi	fjge	fjlt	fjgt	fjle
+			#	HAS
+			#		fbhi	fbls	fbcc	fbcs	fbne	fbeq	fbvc
+			#		fbvs	fbpl	fbmi	fbge	fblt	fbgt	fble
+			#
+			# fjbcc のような仕組みは無いようだ。
+			elsif ($line =~ /^\s+fj(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le)\s+(.*)/) {
+				my $condition	= $1;
+				my $dst			= $2;
+				$modified = '	fb' . $condition . ' ' . modify_args($dst, $src_location);
 			}
 			# jsr 命令
 			#	m68k_gcc
@@ -443,14 +517,6 @@ sub apply_converter {
 				my $op		= $1;
 				my $args	= $2;
 				$modified = '	' . $op . ' ' . modify_args($args, $src_location);
-			}
-			# 冒頭の定型句の修正
-			elsif ($line =~ /^#NO_APP$/) {
-				$modified = '* NO_APP'
-					."\n".	'RUNS_HUMAN_VERSION	equ	3'
-					."\n".	'	.cpu ' . $cpu_type
-					."\n".	'* X68 GCC Develop'
-					."\n";
 			}
 			# 上記いずれにも該当しないなら変更不要
 			else {
@@ -502,6 +568,27 @@ sub apply_converter {
 
 
 #------------------------------------------------------------------------------
+#	10 進数に正規化
+#
+#	[parameters]
+#		・$val
+#			10 進数、もしくは 16 進数文字列
+#
+#	[return]
+#		10 進数の値
+#------------------------------------------------------------------------------
+sub normalize_to_dec {
+	my (
+		$val
+	) = @_;
+	if ($val =~ /^0x[0-9a-fA-F]+$/) {
+		$val = hex($val);
+	}
+	return $val;
+}
+
+
+#------------------------------------------------------------------------------
 #	movem 命令のレジスタマスク値にビット並びを反転する
 #
 #	[parameters]
@@ -515,9 +602,35 @@ sub reverse_movem_mask {
 	my (
 		$mask
 	) = @_;
+	$mask = normalize_to_dec($mask);
 	my $reverse_mask = 0;
 	for (my $i = 0; $i < 16; $i++) {
 		if ($mask & (1 << (15 - $i))) {
+			$reverse_mask |= 1 << $i;
+		}
+	}
+	return $reverse_mask;
+}
+
+
+#------------------------------------------------------------------------------
+#	fmovem 命令のレジスタマスク値にビット並びを反転する
+#
+#	[parameters]
+#		・$mask
+#			レジスタマスク値
+#
+#	[return]
+#		レジスタマスク値のビット並び反転結果
+#------------------------------------------------------------------------------
+sub reverse_fmovem_mask {
+	my (
+		$mask
+	) = @_;
+	$mask = normalize_to_dec($mask);
+	my $reverse_mask = 0;
+	for (my $i = 0; $i < 8; $i++) {
+		if ($mask & (1 << (7 - $i))) {
 			$reverse_mask |= 1 << $i;
 		}
 	}
@@ -539,6 +652,7 @@ sub convert_movem_mask_to_reg_list {
 	my (
 		$mask
 	) = @_;
+	$mask = normalize_to_dec($mask);
 	my $reg_list;
 	for (my $i = 0; $i < 16; $i++) {
 		if ($mask & (1 << $i)) {
@@ -548,6 +662,32 @@ sub convert_movem_mask_to_reg_list {
 			} else {
 				$reg_list .= 'a' . ($i & 7);
 			}
+		}
+	}
+	return $reg_list;
+}
+
+
+#------------------------------------------------------------------------------
+#	fmovem 命令のレジスタマスク値を HAS スタイルのレジスタリストに変換
+#
+#	[parameters]
+#		・$mask
+#			レジスタマスク値
+#
+#	[return]
+#		HAS スタイルのレジスタリスト
+#------------------------------------------------------------------------------
+sub convert_fmovem_mask_to_reg_list {
+	my (
+		$mask
+	) = @_;
+	$mask = normalize_to_dec($mask);
+	my $reg_list;
+	for (my $i = 0; $i < 8; $i++) {
+		if ($mask & (1 << $i)) {
+			if ($reg_list ne ''){ $reg_list .= '/' ;}
+			$reg_list .= 'fp' . ($i & 7);
 		}
 	}
 	return $reg_list;
@@ -868,7 +1008,40 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression = $1;
-			my $modified_arg = '#' . modify_expression($expression, $src_location);
+			my $modified_arg;
+
+			# 9 桁を超える 16 進数は、8 桁ごとに分割して再帰呼出し
+			if ($expression =~ /^0x([0-9a-fA-F]{9,})$/) {
+				my $hex = $1;
+				my $split_hex;
+				for (my $i = 0; $hex ne ''; $i++) {
+					if ($i != 0) {
+						$split_hex .= ',';
+					}
+
+					# 8 桁まとめて切り出す
+					if ($hex =~ /^([0-9a-fA-F]{8})/ ) {
+						$split_hex .= '#0x' . $1;
+						$hex = $` . $';
+					}
+					# 8 桁未満をまとめて切り出す
+					elsif ($hex =~ /^([0-9a-fA-F]{1,7})/ ) {
+						$split_hex .= '#0x' . $1;
+						$hex = $` . $';
+					}
+					# エラー
+					elsif ($hex ne '') {
+						die("$src_location: ERROR: modify_args failed to parse [$expression] as hex.\n");
+					}
+				}
+
+				# 再帰呼出し
+				$modified_arg = modify_args($split_hex, $src_location);
+			}
+			else {
+				$modified_arg = '#' . modify_expression($expression, $src_location);
+			}
+
 			if (DEBUG) {
 				print "	arg [$modified_arg] as #imm\n";
 			}
