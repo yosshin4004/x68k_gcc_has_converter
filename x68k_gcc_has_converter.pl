@@ -45,8 +45,8 @@ use constant {
 
 # 10 進数または 16 進数にマッチする正規表現
 #	16 進数冒頭の 0x が 10 進数の一部と認識されること等を避けるため、
-#	後続が a-zA-Z_ でない場合のみ 10 進数と判定している。
-my $g_regex_dec_or_hex	= '(?:\\d+(?![a-zA-Z_])|0x[0-9a-fA-F]+)';
+#	先に 16 進数側を評価する。
+my $g_regex_dec_or_hex	= '(?:0x[0-9a-fA-F]+|\\d+)';
 
 # 数値またはラベル名または式にマッチする正規表現
 my $g_regex_expression	= '[a-zA-Z0-9_.\\+\\-]+';
@@ -406,7 +406,7 @@ sub apply_converter {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
-				$modified = $op . ' ' . convert_movem_mask_to_reg_list($mask) . ',' . $dst;
+				$modified = $op . ' ' . convert_movem_mask_to_reg_list($mask) . ',' . modify_args($dst, $src_location);
 			}
 			# movem 命令（プレデクリメントモード）のレジスタ指定
 			#	m68k_gcc
@@ -417,7 +417,7 @@ sub apply_converter {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
-				$modified = $op . ' ' . convert_movem_mask_to_reg_list(reverse_movem_mask($mask)) . ',' . $dst;
+				$modified = $op . ' ' . convert_movem_mask_to_reg_list(reverse_movem_mask($mask)) . ',' . modify_args($dst, $src_location);
 			}
 			# movem 命令のレジスタ指定
 			#	m68k_gcc
@@ -428,7 +428,7 @@ sub apply_converter {
 				my $op		= $1;
 				my $src		= $2;
 				my $mask	= $3;
-				$modified = $op . ' ' . $src . ',' . convert_movem_mask_to_reg_list($mask);
+				$modified = $op . ' ' . modify_args($src, $src_location) . ',' . convert_movem_mask_to_reg_list($mask);
 			}
 			# fmovem 命令（制御・可変モード）のレジスタ指定
 			#	m68k_gcc
@@ -441,7 +441,7 @@ sub apply_converter {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
-				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask)) . ',' . $dst;
+				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask)) . ',' . modify_args($dst, $src_location);
 			}
 			# fmovem 命令（プレデクリメントモード）のレジスタ指定
 			#	m68k_gcc
@@ -454,7 +454,7 @@ sub apply_converter {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
-				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list($mask) . ',' . $dst;
+				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list($mask) . ',' . modify_args($dst, $src_location);
 			}
 			# fmovem 命令のレジスタ指定
 			#	m68k_gcc
@@ -467,7 +467,7 @@ sub apply_converter {
 				my $op		= $1;
 				my $src		= $2;
 				my $mask	= $3;
-				$modified = $op . ' ' . $src . ',' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask));
+				$modified = $op . ' ' . modify_args($src, $src_location) . ',' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask));
 			}
 			# jXX 命令
 			#	m68k_gcc
@@ -523,29 +523,6 @@ sub apply_converter {
 				$modified = $line;
 			}
 		}
-
-		# レジスタの表記を修正
-		#	m68k_gcc
-		#		%fp0-%fp7
-		#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr %fpcr %fpsr %fpiar
-		#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の ix として出現する）
-		#	HAS
-		#		fp0-fp7
-		#		d0-d7 a0-a7 sp a6 ccr sr fpcr fpsr fpiar
-		#		d0.l d1.w d2.b
-		$modified =~ s/%(fp[0-7])/\1/g;
-		$modified =~ s/%fpcr/fpcr/g;
-		$modified =~ s/%fpsr/fpsr/g;
-		$modified =~ s/%fpiar/fpiar/g;
-		$modified =~ s/%(d[0-7])\:([bwl])/\1.\2/g;
-		$modified =~ s/%(a[0-7])\:([bwl])/\1.\2/g;
-		$modified =~ s/%(d[0-7])/\1/g;
-		$modified =~ s/%(a[0-7])/\1/g;
-		$modified =~ s/%sp/sp/g;
-		$modified =~ s/%fp/a6/g;		# 浮動小数レジスタの一部と認識されることを避けるため最後に置換する
-		$modified =~ s/%pc/pc/g;
-		$modified =~ s/%ccr/ccr/g;
-		$modified =~ s/%sr/sr/g;
 
 		# 変換前の記述をコメント行として付加
 		{
@@ -639,14 +616,14 @@ sub reverse_fmovem_mask {
 
 
 #------------------------------------------------------------------------------
-#	movem 命令のレジスタマスク値を HAS スタイルのレジスタリストに変換
+#	movem 命令のレジスタマスク値を HAS 形式のレジスタリストに変換
 #
 #	[parameters]
 #		・$mask
 #			レジスタマスク値
 #
 #	[return]
-#		HAS スタイルのレジスタリスト
+#		HAS 形式のレジスタリスト
 #------------------------------------------------------------------------------
 sub convert_movem_mask_to_reg_list {
 	my (
@@ -669,14 +646,14 @@ sub convert_movem_mask_to_reg_list {
 
 
 #------------------------------------------------------------------------------
-#	fmovem 命令のレジスタマスク値を HAS スタイルのレジスタリストに変換
+#	fmovem 命令のレジスタマスク値を HAS 形式のレジスタリストに変換
 #
 #	[parameters]
 #		・$mask
 #			レジスタマスク値
 #
 #	[return]
-#		HAS スタイルのレジスタリスト
+#		HAS 形式のレジスタリスト
 #------------------------------------------------------------------------------
 sub convert_fmovem_mask_to_reg_list {
 	my (
@@ -695,7 +672,7 @@ sub convert_fmovem_mask_to_reg_list {
 
 
 #------------------------------------------------------------------------------
-#	ラベルを HAS スタイルに修正する
+#	ラベルを HAS 形式に修正する
 #
 #	[parameters]
 #		・$label
@@ -705,7 +682,7 @@ sub convert_fmovem_mask_to_reg_list {
 #			ソースの位置情報
 #
 #	[return]
-#		HAS スタイルのラベル
+#		HAS 形式のラベル
 #------------------------------------------------------------------------------
 sub modify_label {
 	my (
@@ -718,7 +695,61 @@ sub modify_label {
 
 
 #------------------------------------------------------------------------------
-#	ラベル交じりの式を HAS スタイルに修正する
+#	レジスタを HAS 形式に修正する
+#
+#	[parameters]
+#		・$register
+#			レジスタ
+#
+#		・$src_location
+#			ソースの位置情報
+#
+#	[return]
+#		HAS 形式のレジスタ
+#------------------------------------------------------------------------------
+sub modify_register {
+	my (
+		$register,
+		$src_location
+	) = @_;
+
+	# レジスタ名とオペランドサイズ表記の修正
+	#	m68k_gcc
+	#		%fp0-%fp7
+	#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr %fpcr %fpsr %fpiar
+	#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の ix として出現する）
+	#	HAS
+	#		fp0-fp7
+	#		d0-d7 a0-a7 sp a6 ccr sr fpcr fpsr fpiar
+	#		d0.l d1.w d2.b
+	$register =~ s/%(fp[0-7])/\1/g;
+	$register =~ s/%fpcr/fpcr/g;
+	$register =~ s/%fpsr/fpsr/g;
+	$register =~ s/%fpiar/fpiar/g;
+	$register =~ s/%(d[0-7])\:([bwl])/\1.\2/g;
+	$register =~ s/%(a[0-7])\:([bwl])/\1.\2/g;
+	$register =~ s/%(d[0-7])/\1/g;
+	$register =~ s/%(a[0-7])/\1/g;
+	$register =~ s/%sp/sp/g;
+	$register =~ s/%fp/a6/g;		# 浮動小数レジスタの一部と認識されることを避けるため最後に置換する
+	$register =~ s/%pc/pc/g;
+	$register =~ s/%ccr/ccr/g;
+	$register =~ s/%sr/sr/g;
+
+	# ビットフィールドの修正
+	if ($register =~ /($g_regex_bitfield)/) {
+		my $pre			= $`;
+		my $bitfield	= $1;
+		my $post		= $';
+		$register = $pre . modify_bitfield($bitfield) . $post;
+	}
+
+	return $register;
+}
+
+
+#------------------------------------------------------------------------------
+#	ラベル交じりの式を HAS 形式に修正する
 #
 #	[parameters]
 #		・$expression
@@ -728,7 +759,7 @@ sub modify_label {
 #			ソースの位置情報
 #
 #	[return]
-#		HAS スタイルの式
+#		HAS 形式の式
 #------------------------------------------------------------------------------
 sub modify_expression {
 	my (
@@ -744,8 +775,8 @@ sub modify_expression {
 		# レジスタ指定
 		if ($input =~ /^($g_regex_register)/) {
 			$input = $` . $';
-			my $reg = $1;
-			push(@a_term, $reg);
+			my $register = $1;
+			push(@a_term, modify_register($register, $src_location));
 			next;
 		}
 
@@ -799,7 +830,39 @@ sub modify_expression {
 
 
 #------------------------------------------------------------------------------
-#	引数リストを HAS スタイルに修正する
+#	ビットフィールドの修正
+#
+#	[parameters]
+#		・$bitfield
+#
+#		・$src_location
+#			ソースの位置情報
+#
+#	[return]
+#		HAS 形式のビットフィールド
+#------------------------------------------------------------------------------
+sub modify_bitfield {
+	my (
+		$bitfield,
+		$src_location
+	) = @_;
+
+	# gas では width に 0 が指定可能だが HAS ではエラーになる。代わりに 32 を指定する。
+	if ($bitfield =~ /^\{(?:\#)?(\d+)\:(?:\#)?(\d+)\}$/) {
+		my $offset	= $1;
+		my $width	= $2;
+		if ($width == 0) {
+			$width = 32;
+		}
+		$bitfield = "{\#$offset:\#$width}";
+	}
+
+	return $bitfield;
+}
+
+
+#------------------------------------------------------------------------------
+#	引数リストを HAS 形式に修正する
 #
 #	[parameters]
 #		・$args
@@ -809,7 +872,7 @@ sub modify_expression {
 #			ソースの位置情報
 #
 #	[return]
-#		HAS スタイルの引数リスト
+#		HAS 形式の引数リスト
 #------------------------------------------------------------------------------
 sub modify_args {
 	my (
@@ -844,8 +907,8 @@ sub modify_args {
 			$input =~ /^($g_regex_register)/
 		) {
 			$input = $` . $';
-			my $reg = $1;
-			my $modified_arg = $reg;
+			my $register = $1;
+			my $modified_arg = modify_register($register, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as register\n";
 			}
@@ -857,9 +920,9 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression	= $1;
-			my $reg			= $2;
+			my $register	= $2;
 			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')' . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as abs(ix)\n";
 			}
@@ -873,7 +936,7 @@ sub modify_args {
 			my $expression	= $1;
 			my $ix			= $2;
 			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . $ix . ')' . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as %pc@(d8,ix)\n";
 			}
@@ -884,8 +947,8 @@ sub modify_args {
 			$input =~ /^\(($g_regex_an)\)\+/
 		) {
 			$input = $` . $';
-			my $reg = $1;
-			my $modified_arg = '(' . $reg . ')+';
+			my $register = $1;
+			my $modified_arg = '(' . modify_register($register, $src_location) . ')+';
 			if (DEBUG) {
 				print "	arg [$modified_arg] as (an)+\n";
 			}
@@ -896,8 +959,8 @@ sub modify_args {
 			$input =~ /^\-\(($g_regex_an)\)/
 		) {
 			$input = $` . $';
-			my $reg = $1;
-			my $modified_arg = '-(' . $reg . ')';
+			my $register = $1;
+			my $modified_arg = '-(' . modify_register($register, $src_location) . ')';
 			if (DEBUG) {
 				print "	arg [$modified_arg] as -(an)\n";
 			}
@@ -909,9 +972,9 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression	= $1;
-			my $reg			= $2;
+			my $register	= $2;
 			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')' . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as d16(an)\n";
 			}
@@ -923,9 +986,9 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression	= $1;
-			my $reg			= $2;
+			my $register	= $2;
 			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ')' . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as (d16, an)\n";
 			}
@@ -937,10 +1000,10 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression	= $1;
-			my $reg			= $2;
+			my $register	= $2;
 			my $ix			= $3;
 			my $bitfield	= $4;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . $reg . ',' . $ix . ')' . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ',' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as d8(an,ix)\n";
 			}
@@ -952,10 +1015,10 @@ sub modify_args {
 		) {
 			$input = $` . $';
 			my $expression	= $1;
-			my $reg			= $2;
+			my $register	= $2;
 			my $ix			= $3;
 			my $bitfield	= $4;
-			my $modified_arg = '(' . modify_expression($expression, $src_location) . ','  . $reg . ',' . $ix . ')' . $bitfield;
+			my $modified_arg = '(' . modify_expression($expression, $src_location) . ',' . modify_register($register, $src_location) . ',' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as (d8,an,ix)\n";
 			}
@@ -969,7 +1032,7 @@ sub modify_args {
 			my $expression	= $1;
 			my $ix			= $2;
 			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(%pc,' . $ix . ')' . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as d8(pc,ix)\n";
 			}
@@ -980,9 +1043,9 @@ sub modify_args {
 			$input =~ /^\(($g_regex_an)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $reg			= $1;
+			my $register	= $1;
 			my $bitfield	= $2;
-			my $modified_arg = '(' . $reg . ')' . $bitfield;
+			my $modified_arg = '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as (an)\n";
 			}
@@ -993,10 +1056,10 @@ sub modify_args {
 			$input =~ /^\(($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
 		) {
 			$input = $` . $';
-			my $reg			= $1;
+			my $register	= $1;
 			my $ix			= $2;
 			my $bitfield	= $3;
-			my $modified_arg = '(' . $reg . ',' . $ix . ')' . $bitfield;
+			my $modified_arg = '(' . modify_register($register, $src_location) . ',' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as (an,ix)\n";
 			}
@@ -1054,7 +1117,7 @@ sub modify_args {
 			$input = $` . $';
 			my $expression	= $1;
 			my $bitfield	= $2;
-			my $modified_arg = modify_expression($expression, $src_location) . $bitfield;
+			my $modified_arg = modify_expression($expression, $src_location) . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as expression\n";
 			}
@@ -1068,7 +1131,7 @@ sub modify_args {
 			my $expression	= $1;
 			my $opsize		= $2;
 			my $bitfield	= $3;
-			my $modified_arg = '(' . modify_expression($expression, $src_location) . $opsize . ')' . $bitfield;
+			my $modified_arg = '(' . modify_expression($expression, $src_location) . $opsize . ')' . modify_bitfield($bitfield, $src_location);
 			if (DEBUG) {
 				print "	arg [$modified_arg] as (expression)\n";
 			}
