@@ -233,9 +233,19 @@ sub apply_converter {
 	my $fh_input  = IO::File->new($input_file_name,  'r') or die("ERROR : Cannot open [" . $input_file_name  . "].\n");
 	my $fh_output = IO::File->new($output_file_name, 'w') or die("ERROR : Cannot open [" . $output_file_name . "].\n");
 
+	# 冒頭の定型行を出力
+	print $fh_output
+			'* NO_APP'
+	."\n".	'RUNS_HUMAN_VERSION	equ	3'
+	."\n".	'	.cpu ' . $cpu_type
+#	."\n".	'	.include doscall.equ'
+	."\n".	'* X68 GCC Develop'
+	."\n";
+
 	# 入力ファイル全体を一行ずつ修正
 	my $line;
 	my $line_num;
+	my $inline_asm = 0;
 	while ($line = <$fh_input>) {
 		$line_num++;
 		my $src_location = $input_file_name . ':' . $line_num;
@@ -250,22 +260,25 @@ sub apply_converter {
 		if    ($line =~ /^\s*$/) {
 			$modified = $line;
 		}
-		# * コメント行？
-		elsif ($line =~ /^\s*\*/) {
-			$modified = $line;
+		# NO_APP 行？
+		#	ここより先は inline asm の外であると解釈する。
+		elsif ($line =~ /^\s*\#NO_APP$/) {
+			$inline_asm = 0;
+			$modified = '* APP OFF (NO_APP)';
 		}
-		# # コメント行？
-		elsif ($line =~ /^\s*\#/) {
-			# 冒頭の定型句の修正
-			if ($line =~ /^#NO_APP$/) {
-				$modified = '* NO_APP'
-					."\n".	'RUNS_HUMAN_VERSION	equ	3'
-					."\n".	'	.cpu ' . $cpu_type
-					."\n".	'* X68 GCC Develop'
-					."\n";
-			} else {
-				$modified = $line;
-			}
+		# APP 行？
+		#	ここより先は inline asm の中であると解釈する。
+		elsif ($line =~ /^\s*\#APP$/) {
+			$inline_asm = 1;
+			$modified = '* APP ON (APP)';
+		}
+		# コメント行？
+		#	| は inline asm 記述時に発生する。コメントアウトしても無害のはず・・・
+		elsif ($line =~ /^\s*(?:\*|\#|\|)/) {
+		}
+		# inline asm の内側は修正をキャンセル
+		elsif ($inline_asm) {
+			$modified = $line;
 		}
 		# ラベル行？
 		#	m68k_gcc
@@ -279,7 +292,7 @@ sub apply_converter {
 			$modified = modify_label($label, $src_location) . ':';
 		}
 		# ディレクティブ行？
-		elsif ($line =~ /^\s+\./) {
+		elsif ($line =~ /^\s*\./) {
 			# バイナリ埋め込みの修正
 			#	m68k_gcc
 			#		.long	123, ...
@@ -289,15 +302,15 @@ sub apply_converter {
 			#		.dc.l	123, ...
 			#		.dc.w	123, ...
 			#		.dc.b	123, ...
-			if ($line =~ /^\s+\.long\s+(.*)/) {
+			if ($line =~ /^\s*\.long\s+(.*)/) {
 				my $param = $1;
 				$modified = '	.dc.l ' . modify_args($param, $src_location);
 			}
-			elsif ($line =~ /^\s+\.word\s+(.*)/) {
+			elsif ($line =~ /^\s*\.word\s+(.*)/) {
 				my $param = $1;
 				$modified = '	.dc.w ' . modify_args($param, $src_location);
 			}
-			elsif ($line =~ /^\s+\.byte\s+(.*)/) {
+			elsif ($line =~ /^\s*\.byte\s+(.*)/) {
 				my $param = $1;
 				$modified = '	.dc.b ' . modify_args($param, $src_location);
 			}
@@ -306,7 +319,7 @@ sub apply_converter {
 			#		.string	"ABC"
 			#	HAS
 			#		.dc.b $41,$42,$43,$00	（末端に \0 が付加される）
-			elsif ($line =~ /^\s+\.string\s+\"(.*)\"/) {
+			elsif ($line =~ /^\s*\.string\s+\"(.*)\"/) {
 				my $string	= $1;
 				$modified = convert_string_to_dump($string);
 			}
@@ -315,7 +328,7 @@ sub apply_converter {
 			#		.ascii "\b\007\009"
 			#	HAS
 			#		.dc.b $08,$07,$09	（末端に \0 が付加されない）
-			elsif ($line =~ /^\s+\.ascii\s+\"(.*)\"/) {
+			elsif ($line =~ /^\s*\.ascii\s+\"(.*)\"/) {
 				my $string	= $1;
 				$modified = convert_ascii_to_dump($string);
 			}
@@ -324,7 +337,7 @@ sub apply_converter {
 			#		.globl inflateBackInit_
 			#	HAS
 			#		.globl _inflateBackInit_
-			elsif ($line =~ /\s+\.globl\s+(.*)/) {
+			elsif ($line =~ /\s*\.globl\s+(.*)/) {
 				my $label = $1;
 				$modified = '	.globl ' . modify_label($label, $src_location);
 			}
@@ -333,7 +346,7 @@ sub apply_converter {
 			#			.comm	LOCTBL_TOP,16,2
 			#	HAS
 			#			.comm	LOCTBL_TOP,16
-			elsif ($line =~ /\s+\.comm\s+(.*),($g_regex_dec_or_hex),($g_regex_dec_or_hex)/) {
+			elsif ($line =~ /\s*\.comm\s+(.*),($g_regex_dec_or_hex),($g_regex_dec_or_hex)/) {
 				my $label = $1;
 				my $size  = $2;
 				my $align = $3;
@@ -346,7 +359,7 @@ sub apply_converter {
 			#		.zero	123
 			#	HAS
 			#		.ds.b	16
-			elsif ($line =~ /\s+\.zero\s+($g_regex_dec_or_hex)/) {
+			elsif ($line =~ /\s*\.zero\s+($g_regex_dec_or_hex)/) {
 				my $size = $1;
 				$modified = '	.ds.b ' . $size;
 			}
@@ -357,7 +370,7 @@ sub apply_converter {
 			#		等々
 			#	HAS
 			#		.data
-			elsif ($line =~ /\s+\.section\s+\.rodata/) {
+			elsif ($line =~ /\s*\.section\s+\.rodata/) {
 				$modified = '	.data';
 			}
 			# BSS セクション
@@ -365,7 +378,7 @@ sub apply_converter {
 			#		.section	.bss
 			#	HAS
 			#		.bss
-			elsif ($line =~ /\s+\.section\s+\.bss/) {
+			elsif ($line =~ /\s*\.section\s+\.bss/) {
 				$modified = '	.bss';
 			}
 			# HAS が認識できないディレクティブの除去
@@ -376,7 +389,7 @@ sub apply_converter {
 			#	.section	必要なものは個別に認識済み
 			#	.swbeg		詳細不明
 			#	.cfi_...	デバッグ情報らしい
-			elsif ($line =~ /^\s+\.(local\s+|type\s+|size\s+|ident\s+|section\s+|swbeg\s+|cfi_\w+\s+)/) {
+			elsif ($line =~ /^\s*\.(local\s+|type\s+|size\s+|ident\s+|section\s+|swbeg\s+|cfi_\w+\s+)/) {
 			}
 			# アライメントの指定を修正
 			#	m68k_gcc
@@ -387,7 +400,7 @@ sub apply_converter {
 			# m68k_gcc では、アライメントで発生するパディングの値を
 			# 指定できるようだが、該当する機能が HAS には存在しない。
 			# .align で代用する。
-			elsif ($line =~ /^\s+\.balignw\s+($g_regex_dec_or_hex),(.*)/) {
+			elsif ($line =~ /^\s*\.balignw\s+($g_regex_dec_or_hex),(.*)/) {
 				my $align	= $1;
 				my $padding	= $2;
 				$modified = '	.align ' . $align;
@@ -402,7 +415,7 @@ sub apply_converter {
 			#		movem.l #15360,<ea>
 			#	HAS
 			#		movem.l d3/d4/d5/a3/a4,<ea>
-			if ($line =~ /(^\s+movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
+			if ($line =~ /(^\s*movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -413,7 +426,7 @@ sub apply_converter {
 			#		movem.l #15360,-(an)
 			#	HAS
 			#		movem.l d3/d4/d5/a3/a4,-(an)
-			elsif ($line =~ /(^\s+movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
+			elsif ($line =~ /(^\s*movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -424,7 +437,7 @@ sub apply_converter {
 			#		movem.l <ea>,#1148
 			#	HAS
 			#		movem.l <ea>,d2/d3/d4/d5/d6/a2
-			elsif ($line =~ /(^\s+movem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
+			elsif ($line =~ /(^\s*movem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
 				my $op		= $1;
 				my $src		= $2;
 				my $mask	= $3;
@@ -437,7 +450,7 @@ sub apply_converter {
 			#		fmovem fp0/fp1/fp2/fp3/fp4/fp5,<ea>
 			#
 			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
-			elsif ($line =~ /(^\s+fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
+			elsif ($line =~ /(^\s*fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -450,7 +463,7 @@ sub apply_converter {
 			#		fmovem.l fp0/fp1/fp2/fp3/fp4/fp5,-(an)
 			#
 			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
-			elsif ($line =~ /(^\s+fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
+			elsif ($line =~ /(^\s*fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
 				my $op		= $1;
 				my $mask	= $2;
 				my $dst		= $3;
@@ -463,7 +476,7 @@ sub apply_converter {
 			#		fmovem.l <ea>,fp0/fp1/fp2/fp3/fp4/fp5
 			#
 			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
-			elsif ($line =~ /(^\s+fmovem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
+			elsif ($line =~ /(^\s*fmovem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
 				my $op		= $1;
 				my $src		= $2;
 				my $mask	= $3;
@@ -480,7 +493,7 @@ sub apply_converter {
 			#		jbra
 			#
 			# HAS では、jcc と bcc を自動選択できる jbcc が使える。
-			elsif ($line =~ /^\s+j(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le|ra)\s+(.*)/) {
+			elsif ($line =~ /^\s*j(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le|ra)\s+(.*)/) {
 				my $condition	= $1;
 				my $dst			= $2;
 				$modified = '	jb' . $condition . ' ' . modify_args($dst, $src_location);
@@ -494,7 +507,7 @@ sub apply_converter {
 			#		fbvs	fbpl	fbmi	fbge	fblt	fbgt	fble
 			#
 			# fjbcc のような仕組みは無いようだ。
-			elsif ($line =~ /^\s+fj(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le)\s+(.*)/) {
+			elsif ($line =~ /^\s*fj(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le)\s+(.*)/) {
 				my $condition	= $1;
 				my $dst			= $2;
 				$modified = '	fb' . $condition . ' ' . modify_args($dst, $src_location);
@@ -506,14 +519,14 @@ sub apply_converter {
 			#		jbra
 			#
 			# HAS では、jsr と bsr を自動選択できる jbsr が使える。
-			elsif ($line =~ /^\s+jsr\s+(.*)/) {
+			elsif ($line =~ /^\s*jsr\s+(.*)/) {
 				my $dst = $1;
 				$modified = '	jbsr ' . modify_args($dst, $src_location);
 			}
 			# その他の命令
 			#
 			# 命令自体は変換不要だが、オペランドは修正する必要がある。
-			elsif ($line =~ /^\s+(.+)\s+(.*)$/) {
+			elsif ($line =~ /^\s*(.+)\s+(.*)$/) {
 				my $op		= $1;
 				my $args	= $2;
 				$modified = '	' . $op . ' ' . modify_args($args, $src_location);
