@@ -14,7 +14,7 @@
 #
 #------------------------------------------------------------------------------
 #
-#	Copyright (C) 2021 Yosshin(@yosshin4004)
+#	Copyright (C) 2022 Yosshin(@yosshin4004)
 #
 #	Licensed under the Apache License, Version 2.0 (the "License");
 #	you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ use strict;
 
 # 使用するモジュール
 use IO::File;
+use Data::Dumper;
 
 # 定数の定義
 use constant {
@@ -43,19 +44,390 @@ use constant {
 	DEBUG	 		=> 0,	# 0 or 1
 };
 
-# 10 進数または 16 進数にマッチする正規表現
-#	16 進数冒頭の 0x が 10 進数の一部と認識されること等を避けるため、
-#	先に 16 進数側を評価する。
-my $g_regex_dec_or_hex	= '(?:0x[0-9a-fA-F]+|\\d+)';
+# エラーメッセージに含ませるソースの位置情報
+my $g_src_location;
 
-# 数値またはラベル名または式にマッチする正規表現
-my $g_regex_expression	= '[a-zA-Z0-9_.\\+\\-]+';
+# アセンブラモード一覧
+my @g_asm_modes = ('gas', 'has');
 
+# シンボルデータベース
+my %g_symbol_db;
+
+
+# シンボル名に利用可能な文字
+#	HAS の詳細仕様が不明なので推測に基づく。
+my $g_regex_symbol_char_wo_num = '[a-zA-Z_?~.]';
+my $g_regex_symbol_char_with_num = '[0-9a-zA-Z_?~.]';
+
+# 後続に名前として認識される文字が存在しないことを確認する正規表現
+#	例えば、/fp$g_regex_end_of_name/ とすると、fp の後続にシンボル名と認識される
+#	文字列が存在しないことを保証することができ、誤って fputs などにマッチしないように
+#	できる。オペランドサイズ指定を可能にするため、後続 . は許容する。
+my $g_regex_end_of_name = '(?![0-9a-zA-Z_?~])';
+
+# 16 進数にマッチする正規表現
+#	16 進数は、0x または $ から始まる。
+#	視認性向上のため _ 区切り表記が許容されている。
+my $g_regex_hex = '(?:(?:0x|\\$)[0-9a-fA-F_]+' . $g_regex_end_of_name . ')';
+
+# 10 進数にマッチする正規表現
+#	視認性向上のため _ 区切り表記が許容されている。
+my $g_regex_dec = '(?:[0-9_]+' . $g_regex_end_of_name . ')';
+
+# 8 進数にマッチする正規表現
+#	8 進数は、0o または @ から始まる。
+#	視認性向上のため _ 区切り表記が許容されている。
+my $g_regex_oct = '(?:(?:0o|\\@)[0-7_]+' . $g_regex_end_of_name . ')';
+
+# 2 進数にマッチする正規表現
+#	2 進数は、0b または % から始まる。
+#	視認性向上のため _ 区切り表記が許容されている。
+my $g_regex_bin = '(?:(?:0b|\\%)[01_]+' . $g_regex_end_of_name . ')';
+
+# 浮動小数にマッチする正規表現
+#	HAS 固有の記述方法。
+#	1234.w が浮動小数 + w と認識されるようなケースを避けるため、
+#	否定先読みで抑止することが必須。
+my $g_regex_float = 
+	'(?:'
+		# 0f1.2345
+.		'0f[0-9]*(?:\\.[0-9]*)?(?![a-zA-Z_.])'
+		# 123.
+.	'|'.'[0-9]+\\.[0-9]*(?![a-zA-Z_.])'
+		# .123
+.	'|'.'[0-9]*\\.[0-9]+(?![a-zA-Z_.])'
+		# !3f80_0000
+.	'|'.'\\![0-9a-fA-F_]+(?![g-zG-Z_.])'
+.	')';
+
+# 整数（16/10/8/2 進数）にマッチする正規表現
+my $g_regex_int =
+	'(?:'
+.		$g_regex_hex
+.	'|'.$g_regex_oct
+.	'|'.$g_regex_bin
+.	'|'.$g_regex_dec
+.	')';
+
+# 整数（16/10/8/2 進数）または浮動小数にマッチする正規表現
+#	誤認識を避けるため、10 進数は最後に評価する。
+my $g_regex_number =
+	'(?:'
+.		$g_regex_hex
+.	'|'.$g_regex_oct
+.	'|'.$g_regex_bin
+.	'|'.$g_regex_float
+.	'|'.$g_regex_dec
+.	')';
+
+
+# ラベルまたはシンボル名にマッチする正規表現
+#	数字からは開始しない。
+#	.L123.4 のように、途中にドットが割り込むことも許容する。
+my $g_regex_label_and_symbol = '(?:' . $g_regex_symbol_char_wo_num . $g_regex_symbol_char_with_num . '*' . $g_regex_end_of_name . ')';
+
+# HAS 拡張機能のローカルラベル名の参照にマッチする正規表現
+#	@f @@f @@@f ...
+#	@b @@b @@@b ...
+#	1f ～ 9f
+#	1b ～ 9b
+#	10f ～ 99f	（HAS060 拡張）
+#	10b ～ 99b	（HAS060 拡張）
+my $g_regex_ref_has_local_label = '(?:(?:@+[fb]|[1-9][fb]|[1-9][0-9][fb])' . $g_regex_end_of_name . ')';
+
+# HAS 拡張機能のローカルラベルにマッチする正規表現
+#	@@:
+#	1: ～ 9:
+#	10: ～ 99:	（HAS060 拡張）
+my $g_regex_has_local_label = '(?:(?:@@|[1-9]|[1-9][0-9])' . $g_regex_end_of_name . ')';
+
+
+# 丸括弧にマッチする正規表現
+my $g_regex_parenthesis = '(?:[\\(\\)])';
+
+# 単項演算子にマッチする正規表現
+my %g_regex_unary_operator;
+#	HAS 出典元：「ぷにぐらま～ずまにゅある 第七版 第二刷」
+$g_regex_unary_operator{'has'} =
+	'(?:'
+.		'\\.pos\\.|\\+'				# 正
+.	'|'.'\\.neg\\.|\\-'				# 負
+.	'|'.'\\.not\\.'					# 論理 NOT
+.	'|'.'\\.high\\.'				# ロングワード(32ビット)の下位ワードの上位バイトを分離する
+.	'|'.'\\.low\\.'					# ロングワード(32ビット)の下位ワードの下位バイトを分離する
+.	'|'.'\\.highw\\.'				# ロングワード(32ビット)の上位ワードを分離する
+.	'|'.'\\.loww\\.'				# ロングワード(32ビット)の下位ワードを分離する
+.	'|'.'\\.nul\\.'					# 常に 0 を返す
+	# 以下 HAS060 拡張
+.	'|'.'\\.notb\\.'				# 論理 NOT（ 8ビット値）
+.	'|'.'\\.notw\\.'				# 論理 NOT（16ビット値）
+.	')';
+#	GAS 出典元：GNU Assembler Manual
+$g_regex_unary_operator{'gas'} =
+	'(?:'
+									# + は定義されていないようだ。
+.		'\\-'						# Negation. Two’s complement negation.
+.	'|'.'\\~'						# Complementation. Bitwise not.
+.	')';
+
+
+# 二項演算子にマッチする正規表現
+my %g_regex_binary_operator;
+#	HAS 出典元：「ぷにぐらま～ずまにゅある 第七版 第二刷」
+$g_regex_binary_operator{'has'} =
+	'(?:'
+.		'\\.mod\\.'					# 剰余	HAS では % は使えない
+.	'|'.'\\.shr\\.|>>'				# 右論理シフト
+.	'|'.'\\.shl\\.|<<'				# 左論理シフト
+.	'|'.'\\.asr\\.'					# 右算術シフト
+.	'|'.'\\.add\\.|\\+'				# 加算
+.	'|'.'\\.sub\\.|\\-'				# 減算
+.	'|'.'\\.mul\\.|\\*'				# 乗算
+.	'|'.'\\.div\\.|\\/'				# 除算
+.	'|'.'\\.eq\\.|==|='				# 等しい
+.	'|'.'\\.ne\\.|<>|\\!='			# 等しくない
+.	'|'.'\\.le\\.|<='				# le
+.	'|'.'\\.lt\\.|<'				# lt	<< や <= や <> にマッチしてしまうので、それらより後に評価する。
+.	'|'.'\\.ge\\.|>='				# ge
+.	'|'.'\\.gt\\.|>'				# gt	>> や >= にマッチしてしまうので、それらより後に評価する。
+.	'|'.'\\.sle\\.|\\.<=\\.'		# 符号つき le	「ぷにぐらま～ずまにゅある 第七版 第二刷」では .<= となっていたが .<=. に修正した。
+.	'|'.'\\.slt\\.|\\.<\\.'			# 符号つき lt
+.	'|'.'\\.sge\\.|\\.>=\\.'		# 符号つき ge
+.	'|'.'\\.sgt\\.|\\.>\\.'			# 符号つき gt
+.	'|'.'\\.and\\.|\\&'				# 論理 AND
+.	'|'.'\\.or\\.|\\|'				# 論理 OR
+.	'|'.'\\.xor\\.|\\.eor\\.|\\^'	# 排他的 OR
+.	')';
+#	GAS 出典元：GNU Assembler Manual
+$g_regex_binary_operator{'gas'} =
+	'(?:'
+.		'\\*'		# Multiplication.
+.	'|'.'\\/'		# Division.
+.	'|'.'\\%'		# Remainder.
+.	'|'.'<<'		# Shift Left.
+.	'|'.'<'			# 					<< にマッチしてしまうので、それより後に評価する。
+.	'|'.'>>'		# Shift Right.
+.	'|'.'>'			# 					>> にマッチしてしまうので、それより後に評価する。
+.	'|'.'\\|'		# Bitwise Inclusive Or.
+.	'|'.'\\&'		# Bitwise And.
+.	'|'.'\\^'		# Bitwise Exclusive Or.
+.	'|'.'\\!'		# Bitwise Or Not.
+.	'|'.'\\+'		# Addition.
+.	'|'.'\\-'		# Subtraction.
+.	')';
+
+# 演算子にマッチする正規表現
+my %g_regex_operator;
+foreach my $asm_mode (@g_asm_modes) {
+	$g_regex_operator{$asm_mode} =
+		'(?:'
+	.		$g_regex_unary_operator{$asm_mode}
+	.	'|'.$g_regex_binary_operator{$asm_mode}
+	.	')';
+}
+
+# 式にマッチする正規表現
+my %g_regex_expression;
+$g_regex_expression{'has'} =
+	'(?:'
+.		'(?:'
+.			$g_regex_label_and_symbol
+.		'|'.$g_regex_ref_has_local_label
+.		'|'.$g_regex_number
+.		'|'.$g_regex_operator{'has'}
+.		'|'.$g_regex_parenthesis
+.		')+'
+.	')';
+$g_regex_expression{'gas'} =
+	'(?:'
+.		'(?:'
+.			$g_regex_label_and_symbol
+.		'|'.$g_regex_number
+.		'|'.$g_regex_operator{'gas'}
+.		'|'.$g_regex_parenthesis
+.		')+'
+.	')';
+
+# コメントにマッチする正規表現
+#	HAS では * ; 以降がコメントと見なされる。
+#	GAS では * # | 以降がコメントと見なされるようだ。
+#	GAS の | コメントは inline asm 記述時に発生する。
+my $g_regex_comment = '(?:[*\\#|;].*$)';
+
+# 行末コメントにマッチする正規表現
+#	数式で利用する * や | などの演算子がコメントと誤って解釈されることを避けるため、
+#	行末コメントは必ずスペースに後続する必要がある。
+my $g_regex_line_end_comment = '(?:\s+' . $g_regex_comment . ')';
+
+# 行末または行末コメントにマッチする正規表現
+my $g_regex_end = '(?:$|' . $g_regex_line_end_comment . ')';
 
 # 各種オペランドサイズにマッチする正規表現
-#	.b .w .l のように、ドットを使う表記だけでなく、
-#	:b :w :l のような、コロンを使う表記が出現することがある点に注意。
-my $g_regex_opsize = '[:.][bwl]';
+#	.b = byte(1bytes)
+#	.w = word(2bytes)
+#	.l = long(4bytes)
+#	.s = 単精度実数(4bytes)
+#	.d = 倍精度実数(8bytes)
+#	.x = 拡張精度実数(12bytes)
+#	.p = パックドデシマル(12bytes)
+#
+#	HAS と GAS の Motorola Syntax では .b .w .l のように . を使い、
+#	GAS 固有の MIT Syntax では :b :w :l のように : を使う。
+my $g_regex_opsize = '(?:[:.][bwlsdxp]' . $g_regex_end_of_name . ')';
+
+# レジスタのスケールにマッチする正規表現
+#	HAS と GAS の Motorola Syntax では *1 *2 *4 *4 のように * を使い、
+#	GAS 固有の MIT Syntax では :1 :2 :4 :8 のように : を使う。
+my $g_regex_register_scale = '(?:[:*][1248]' . $g_regex_end_of_name . ')';
+
+# ディレクティブにマッチする正規表現
+#	GAS のディレクティブは全貌が不明だが、. から始まるならディレクティブと
+#	見なせるので単純な正規表現で認識可能。
+#
+#	一方 HAS のディレクティブは . を省略可能なため、インストラクションとの
+#	区別が難しい。やむを得ず全ディレクティブをパターンマッチするしかない。
+#	ここでは「ぷにぐらま～ずまにゅある 第七版 第二刷」の HAS の解説に
+#	書かれている情報を元に正規表現を定義している。
+my %g_regex_directive;
+$g_regex_directive{'has'} =
+	'(?:'
+.		'\.?'
+.		'(?:'
+		# アセンブラ制御
+.			'text'
+.		'|'.'data'
+.		'|'.'bss'
+.		'|'.'stack'
+.		'|'.'offset'
+.		'|'.'include'
+.		'|'.'comm'
+.		'|'.'end'
+.		'|'.'org'
+.		'|'.'comment'
+.		'|'.'fail'
+.		'|'.'request'
+.		'|'.'cpu'
+.		'|'.'fpid'
+.		'|'.'rdata'
+.		'|'.'rldata'
+.		'|'.'rbbs'
+.		'|'.'rlbbs'
+.		'|'.'rstack'
+.		'|'.'rlstack'
+.		'|'.'rcomm'
+.		'|'.'rlcomm'
+.		'|'.'pragma'
+		# 外部名指定
+.		'|'.'globl'
+.		'|'.'global'
+.		'|'.'xdef'
+.		'|'.'public'
+.		'|'.'entry'
+.		'|'.'xref'
+.		'|'.'extrn'
+.		'|'.'external'
+		# シンボル値定義
+		#	g_regex_symbol_definition_directive に分離した。
+		# マクロ制御
+.		'|'.'macro'
+.		'|'.'local'
+.		'|'.'endm'
+.		'|'.'exitm'
+.		'|'.'rept'
+.		'|'.'irp'
+.		'|'.'irpc'
+		# データ定義・領域確保
+.		'|'.'dc' . $g_regex_opsize . '?'
+.		'|'.'dcb' . $g_regex_opsize . '?'
+.		'|'.'ds' . $g_regex_opsize . '?'
+.		'|'.'even'
+.		'|'.'align'
+.		'|'.'quad'
+		# 条件つきアセンブリ
+		#	g_regex_conditional_assembly_directive に分離した。
+		# リスティング制御
+.		'|'.'list'
+.		'|'.'nlist'
+.		'|'.'page'
+.		'|'.'title'
+.		'|'.'subttl'
+.		'|'.'lall'
+.		'|'.'sall'
+.		'|'.'width'
+		# シンボリックデバッグ情報指定
+.		'|'.'file'
+.		'|'.'ln'
+.		'|'.'def'
+.		'|'.'endef'
+.		'|'.'val'
+.		'|'.'scl'
+.		'|'.'type'
+.		'|'.'tag'
+.		'|'.'line'
+.		'|'.'size'
+.		'|'.'dim'
+		# cpu 種別の指定
+.		'|'.'68000'
+.		'|'.'68010'
+.		'|'.'68020'
+.		'|'.'68030'
+.		'|'.'68040'
+		# 以下 HAS060 拡張
+.		'|'.'68060'
+.		'|'.'insert'
+.		')'
+.		$g_regex_end_of_name
+.	')';
+#	GAS のディレクティブの全貌が不明。m68k-elf-gcc からは、ドキュメントに記載がない
+#	様々なディレクティブが出力されてくる。これら全てに正確にマッチする正規表現を
+#	定義することは難しい。
+#	幸い、GAS のディレクティブは . で始まるというルールがあるので、それに従い
+#	正規表現を定義すれば問題ない。
+$g_regex_directive{'gas'} = '(?:\\.[a-zA-Z][0-9a-zA-Z]*' . $g_regex_opsize . '?' . $g_regex_end_of_name .')';
+
+# シンボル定義ディレクティブにマッチする正規表現
+#	m68k-elf-gcc から出力されるアセンブリコードには含まれないので、
+#	GAS の定義は不要である。
+my %g_regex_symbol_definition_directive;
+$g_regex_symbol_definition_directive{'has'} =
+	'(?:'
+.		'\\.?'
+.		'(?:'
+.			'equ'
+.		'|'.'set'
+.		'|'.'reg'
+.		'|'.'fequ' . $g_regex_opsize . '?'
+.		'|'.'fset' . $g_regex_opsize . '?'
+.		')'
+.		$g_regex_end_of_name
+.	')';
+
+# 条件付きアセンブリディレクティブにマッチする正規表現
+#	m68k-elf-gcc から出力されるアセンブリコードには含まれないので、
+#	GAS の定義は不要である。
+my %g_regex_conditional_assembly_directive;
+$g_regex_conditional_assembly_directive{'has'} =
+	'(?:'
+.		'\\.?'
+.		'(?:'
+.			'if'
+.		'|'.'ifeq'
+.		'|'.'iff'
+.		'|'.'ifne'
+.		'|'.'ifdef'
+.		'|'.'ifndef'
+.		'|'.'else'
+.		'|'.'elseif'
+.		'|'.'endif'
+.		'|'.'endc'
+.		')'
+.		$g_regex_end_of_name
+.	')';
+
+
+# インストラクションにマッチする正規表現
+#	0 から始まる文字列は除外する。
+my $g_regex_instruction = '(?:[a-zA-Z][0-9a-zA-Z]*' . $g_regex_opsize . '?' . $g_regex_end_of_name .')';
 
 # ビットフィールド（-m68030 指定時に出現）にマッチする正規表現
 #	例:
@@ -63,49 +435,192 @@ my $g_regex_opsize = '[:.][bwl]';
 #		{#1:#2}
 #	参考:
 #		https://stdkmd.net/bitfield/
-my $g_regex_bitfield = '\\{(?:\\#)?\\d+\\:(?:\\#)?\\d+\\}';
+my $g_regex_bitfield = '(?:\\{(?:\\#)?' . $g_regex_int . '\\:(?:\\#)?' . $g_regex_int . '\\})';
 
 # 各種レジスタにマッチする正規表現
-#	a6 を意味する fp と fp0-fp7 は誤認識される危険があるので評価順に注意すること。
-#	参考:
-#		http://yamatyuu.net/computer/68000/index.html
-my $g_regex_dn		= "%d[0-7](?:$g_regex_opsize)?(?:$g_regex_bitfield)?";
-my $g_regex_an		= "(?:%a[0-7]|%fp|%sp)(?:$g_regex_opsize)?(?:$g_regex_bitfield)?";
-my $g_regex_sr		= "%sr(?:$g_regex_bitfield)?";
-my $g_regex_ccr		= "%ccr(?:$g_regex_bitfield)?";
-my $g_regex_fpn		= "(?:%fp[0-7])";
-my $g_regex_fpcr	= "%fpcr(?:$g_regex_bitfield)?";
-my $g_regex_fpsr	= "%fpsr(?:$g_regex_bitfield)?";
-my $g_regex_fpiar	= "%fpiar(?:$g_regex_bitfield)?";
+#	「ぷにぐらま～ずまにゅある 第七版 第二刷」に記載されている全レジスタを定義している。
+#	ここで定義しているものが GAS で利用可能なレジスタと一致しているかは未確認。
+#
+#	HAS モードではレジスタ名に % のようなプリフィックスが付かない。
+#	そのため、レジスタ名がラベルの一部と誤認識される可能性や、
+#	a6 を意味する fp と fp0-fp7 が誤認識される危険がある。
+#	このような問題を回避するため。レジスタ名末尾に否定的先読みを意味する
+#	$g_regex_end_of_name をマッチさせることが必須である。
+my %g_regex_register;
+$g_regex_register{'has'}{'dn'}		= "(?:z?d[0-7]$g_regex_end_of_name$g_regex_opsize?)";
+$g_regex_register{'has'}{'an'}		= "(?:(?:z?a[0-7]|z?fp|z?sp)$g_regex_end_of_name$g_regex_opsize?)";
+$g_regex_register{'has'}{'ssp'}		= "(?:ssp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'usp'}		= "(?:usp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'pc'}		= "(?:(?:z?pc|opc)$g_regex_end_of_name)";
+$g_regex_register{'has'}{'sr'}		= "(?:sr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'ccr'}		= "(?:ccr$g_regex_end_of_name)";
 
-# dn:dn（-m68030 指定時に出現）にマッチする正規表現
-my $g_regex_dn_dn	= "$g_regex_dn\\:$g_regex_dn";
+$g_regex_register{'has'}{'sfc'}		= "(?:sfc$g_regex_end_of_name)";
+$g_regex_register{'has'}{'dfc'}		= "(?:dfc$g_regex_end_of_name)";
+$g_regex_register{'has'}{'vbr'}		= "(?:vbr$g_regex_end_of_name)";
 
-# ix にマッチする正規表現
-my $g_regex_ix =
-	"(?:"
-.		"(?:"
-.			 "$g_regex_dn"
-.			"|$g_regex_an"
-.		")"
-.		"(?:"
-.			"\\*\\d+"	# スケールの指定（-m68030 指定時に出現）
-.		")?"
-.	")";
+$g_regex_register{'has'}{'msp'}		= "(?:msp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'isp'}		= "(?:isp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'cacr'}	= "(?:cacr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'caar'}	= "(?:caar$g_regex_end_of_name)";
+$g_regex_register{'has'}{'buscr'}	= "(?:buscr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'pcr'}		= "(?:pcr$g_regex_end_of_name)";	# 「ぷにぐらま～ずまにゅある 第七版 第二刷」では pc となっていたが pcr に修正した。
 
-# 全レジスタにマッチする正規表現
-my $g_regex_register =
-	"(?:"
-.		 "$g_regex_dn_dn"
-.		"|$g_regex_dn"		# dn:dn にマッチしてしまうので最後に評価する。
-.		"|$g_regex_sr"
-.		"|$g_regex_ccr"
-.		"|$g_regex_fpn"
-.		"|$g_regex_fpcr"
-.		"|$g_regex_fpsr"
-.		"|$g_regex_fpiar"
-.		"|$g_regex_an"		# fp0-fp7 に a6 の別名の fp がマッチしてしまうので最後に評価する。
-.	")";
+$g_regex_register{'has'}{'crp'}		= "(?:crp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'srp'}		= "(?:srp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'tc'}		= "(?:tc$g_regex_end_of_name)";
+$g_regex_register{'has'}{'ttn'}		= "(?:tt[0-1]$g_regex_end_of_name)";
+$g_regex_register{'has'}{'mmusr'}	= "(?:mmusr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'psr'}		= "(?:psr$g_regex_end_of_name)";
+
+$g_regex_register{'has'}{'urp'}		= "(?:urp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'ittn'}	= "(?:itt[0-1]$g_regex_end_of_name)";
+$g_regex_register{'has'}{'dttn'}	= "(?:dtt[0-1]$g_regex_end_of_name)";
+$g_regex_register{'has'}{'nc'}		= "(?:nc$g_regex_end_of_name)";
+$g_regex_register{'has'}{'dc'}		= "(?:dc$g_regex_end_of_name)";
+$g_regex_register{'has'}{'ic'}		= "(?:ic$g_regex_end_of_name)";
+$g_regex_register{'has'}{'bc'}		= "(?:bc$g_regex_end_of_name)";
+
+$g_regex_register{'has'}{'drp'}		= "(?:drp$g_regex_end_of_name)";
+$g_regex_register{'has'}{'cal'}		= "(?:cal$g_regex_end_of_name)";
+$g_regex_register{'has'}{'val'}		= "(?:val$g_regex_end_of_name)";
+$g_regex_register{'has'}{'scc'}		= "(?:scc$g_regex_end_of_name)";
+$g_regex_register{'has'}{'ac'}		= "(?:ac$g_regex_end_of_name)";
+$g_regex_register{'has'}{'pcsr'}	= "(?:pcsr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'badn'}	= "(?:bad[0-7]$g_regex_end_of_name)";
+$g_regex_register{'has'}{'bacn'}	= "(?:bac[0-7]$g_regex_end_of_name)";
+
+$g_regex_register{'has'}{'fpn'}		= "(?:fp[0-7]$g_regex_end_of_name)";
+$g_regex_register{'has'}{'fpcr'}	= "(?:fpcr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'fpsr'}	= "(?:fpsr$g_regex_end_of_name)";
+$g_regex_register{'has'}{'fpiar'}	= "(?:fpiar$g_regex_end_of_name)";
+
+foreach my $key (keys(%{$g_regex_register{'has'}})) {
+	$g_regex_register{'gas'}{$key} = '%' . $g_regex_register{'has'}{$key};
+}
+
+# 正規表現を組み合わせる
+foreach my $asm_mode (@g_asm_modes) {
+	# Dn:Dn（-m68030 指定時に出現）にマッチする正規表現
+	$g_regex_register{$asm_mode}{'dn_dn'} = '(?:' . $g_regex_register{$asm_mode}{'dn'} . '\\:' . $g_regex_register{$asm_mode}{'dn'} . ')';
+
+	# Xi にマッチする正規表現
+	$g_regex_register{$asm_mode}{'xi'} =
+		'(?:'
+	.		'(?:'
+	.			$g_regex_register{$asm_mode}{'dn'}
+	.		'|'.$g_regex_register{$asm_mode}{'an'}
+	.		')'
+	.		'(?:'
+	.			$g_regex_register_scale		# スケールの指定（-m68030 指定時に出現）
+	.		')?'
+	.	')';
+
+	# 全レジスタにマッチする正規表現
+	$g_regex_register{$asm_mode}{'all'} =
+		'(?:'
+	.		$g_regex_register{$asm_mode}{'dn_dn'}
+	.	'|'.$g_regex_register{$asm_mode}{'dn'}
+	.	'|'.$g_regex_register{$asm_mode}{'an'}
+	.	'|'.$g_regex_register{$asm_mode}{'sr'}
+	.	'|'.$g_regex_register{$asm_mode}{'ccr'}
+	.	'|'.$g_regex_register{$asm_mode}{'fpn'}
+	.	'|'.$g_regex_register{$asm_mode}{'fpcr'}
+	.	'|'.$g_regex_register{$asm_mode}{'fpsr'}
+	.	'|'.$g_regex_register{$asm_mode}{'pc'}
+
+	.	'|'.$g_regex_register{$asm_mode}{'dn'}
+	.	'|'.$g_regex_register{$asm_mode}{'an'}
+	.	'|'.$g_regex_register{$asm_mode}{'ssp'}
+	.	'|'.$g_regex_register{$asm_mode}{'usp'}
+	.	'|'.$g_regex_register{$asm_mode}{'pc'}
+	.	'|'.$g_regex_register{$asm_mode}{'sr'}
+	.	'|'.$g_regex_register{$asm_mode}{'ccr'}
+
+	.	'|'.$g_regex_register{$asm_mode}{'sfc'}
+	.	'|'.$g_regex_register{$asm_mode}{'dfc'}
+	.	'|'.$g_regex_register{$asm_mode}{'vbr'}
+
+	.	'|'.$g_regex_register{$asm_mode}{'msp'}
+	.	'|'.$g_regex_register{$asm_mode}{'isp'}
+	.	'|'.$g_regex_register{$asm_mode}{'cacr'}
+	.	'|'.$g_regex_register{$asm_mode}{'caar'}
+	.	'|'.$g_regex_register{$asm_mode}{'buscr'}
+	.	'|'.$g_regex_register{$asm_mode}{'pcr'}	# 「ぷにぐらま～ずまにゅある 第七版 第二刷」では pc となっていたが pcr に修正した。
+
+	.	'|'.$g_regex_register{$asm_mode}{'crp'}
+	.	'|'.$g_regex_register{$asm_mode}{'srp'}
+	.	'|'.$g_regex_register{$asm_mode}{'tc'}
+	.	'|'.$g_regex_register{$asm_mode}{'ttn'}
+	.	'|'.$g_regex_register{$asm_mode}{'mmusr'}
+	.	'|'.$g_regex_register{$asm_mode}{'psr'}
+
+	.	'|'.$g_regex_register{$asm_mode}{'urp'}
+	.	'|'.$g_regex_register{$asm_mode}{'ittn'}
+	.	'|'.$g_regex_register{$asm_mode}{'dttn'}
+	.	'|'.$g_regex_register{$asm_mode}{'nc'}
+	.	'|'.$g_regex_register{$asm_mode}{'dc'}
+	.	'|'.$g_regex_register{$asm_mode}{'ic'}
+	.	'|'.$g_regex_register{$asm_mode}{'bc'}
+
+	.	'|'.$g_regex_register{$asm_mode}{'drp'}
+	.	'|'.$g_regex_register{$asm_mode}{'cal'}
+	.	'|'.$g_regex_register{$asm_mode}{'val'}
+	.	'|'.$g_regex_register{$asm_mode}{'scc'}
+	.	'|'.$g_regex_register{$asm_mode}{'ac'}
+	.	'|'.$g_regex_register{$asm_mode}{'pcsr'}
+	.	'|'.$g_regex_register{$asm_mode}{'badn'}
+	.	'|'.$g_regex_register{$asm_mode}{'bacn'}
+
+	.	'|'.$g_regex_register{$asm_mode}{'fpn'}
+	.	'|'.$g_regex_register{$asm_mode}{'fpcr'}
+	.	'|'.$g_regex_register{$asm_mode}{'fpsr'}
+	.	'|'.$g_regex_register{$asm_mode}{'fpiar'}
+	.	')';
+
+	# movem レジスタリストにマッチする正規表現
+	$g_regex_register{$asm_mode}{'movem_reg_list'} =
+		'(?:'
+	.		'(?:'
+	.			$g_regex_register{$asm_mode}{'dn'}
+	.		'|'.$g_regex_register{$asm_mode}{'an'}
+	.		')'
+	.		'(?:'
+	.			'[\/\-]'
+	.			'(?:'
+	.				$g_regex_register{$asm_mode}{'dn'}
+	.			'|'.$g_regex_register{$asm_mode}{'an'}
+	.			')'
+	.		')*'
+	.	')';
+
+	# fmovem レジスタリストにマッチする正規表現
+	$g_regex_register{$asm_mode}{'fmovem_reg_list'} =
+		'(?:'
+	.		$g_regex_register{$asm_mode}{'fpn'}
+	.		'(?:'
+	.			'[\/\-]'
+	.			$g_regex_register{$asm_mode}{'fpn'}
+	.		')*'
+	.	')';
+}
+if (0) {
+	use Data::Dumper;
+	print Dumper(\%g_regex_register);
+	exit(0);
+}
+
+
+# インストラクションのアドレッシングの引数（Dn An PC d bd address）にマッチする正規表現
+my %g_regex_addressing_arg;
+foreach my $asm_mode (@g_asm_modes) {
+	$g_regex_addressing_arg{$asm_mode} =
+		'(?:'
+	.		$g_regex_register{$asm_mode}{'all'}
+	.	'|'.$g_regex_register{$asm_mode}{'xi'}
+	.	'|'.$g_regex_expression{$asm_mode}
+	.	')';
+}
 
 # 引数解析～コンバータ適用
 {
@@ -115,13 +630,13 @@ my $g_regex_register =
 	my $cpu_type = '68000';
 
 	# 引数カウント
-	my $argc = $#ARGV + 1;
+	my $argc = @ARGV;
 
 	# 引数なしで起動した場合はヘルプを表示して終了
 	if ($argc == 0) {
 		print	''
 		."\n".	'x68k_gcc_has_converter'
-		."\n".	'Copyright (C) 2021 Yosshin(@yosshin4004)'
+		."\n".	'Copyright (C) 2022 Yosshin(@yosshin4004)'
 		."\n".	''
 		."\n".	'This is a converter translates asm sources generated by m68k-elf-gcc'
 		."\n".	'into a format that processible by HAS.X (X68K High-Speed Assembler by'
@@ -199,7 +714,7 @@ my $g_regex_register =
 		exit(EXIT_FAILURE);
 	}
 
-	# コンバータ本体実行
+	# コンバータ適用
 	apply_converter($input_file_name, $output_file_name, $cpu_type);
 }
 
@@ -230,330 +745,211 @@ sub apply_converter {
 		$cpu_type,
 	) = @_;
 
-	my $fh_input  = IO::File->new($input_file_name,  'r') or die("ERROR : Cannot open [" . $input_file_name  . "].\n");
-	my $fh_output = IO::File->new($output_file_name, 'w') or die("ERROR : Cannot open [" . $output_file_name . "].\n");
-
-	# 冒頭の定型行を出力
-	print $fh_output
-			'* NO_APP'
-	."\n".	'RUNS_HUMAN_VERSION	equ	3'
-	."\n".	'	.cpu ' . $cpu_type
-#	."\n".	'	.include doscall.equ'
-	."\n".	'* X68 GCC Develop'
-	."\n";
-
-	# 入力ファイル全体を一行ずつ修正
-	my $line;
-	my $line_num;
-	my $inline_asm = 0;
-	while ($line = <$fh_input>) {
-		$line_num++;
-		my $src_location = $input_file_name . ':' . $line_num;
-
-		chomp($line);
-		my $orig = $line;
-
-		# 修正結果の生成先
-		my $modified;
-
-		# 空行？
-		if    ($line =~ /^\s*$/) {
-			$modified = $line;
-		}
-		# NO_APP 行？
-		#	ここより先は inline asm の外であると解釈する。
-		elsif ($line =~ /^\s*\#NO_APP$/) {
-			$inline_asm = 0;
-			$modified = '* APP OFF (NO_APP)';
-		}
-		# APP 行？
-		#	ここより先は inline asm の中であると解釈する。
-		elsif ($line =~ /^\s*\#APP$/) {
-			$inline_asm = 1;
-			$modified = '* APP ON (APP)';
-		}
-		# コメント行？
-		#	| は inline asm 記述時に発生する。コメントアウトしても無害のはず・・・
-		elsif ($line =~ /^\s*(?:\*|\#|\|)/) {
-		}
-		# inline asm の内側は修正をキャンセル
-		elsif ($inline_asm) {
-			$modified = $line;
-		}
-		# ラベル行？
-		#	m68k_gcc
-		#		abc:
-		#	HAS
-		#		_abc:
-		#
-		# 行頭から始まり : で終わる文字列をラベルと認識する。
-		elsif ($line =~ /^([a-zA-Z_?.].*)\:/) {
-			my $label = $1;
-			$modified = modify_label($label, $src_location) . ':';
-		}
-		# ディレクティブ行？
-		elsif ($line =~ /^\s*\./) {
-			# バイナリ埋め込みの修正
-			#	m68k_gcc
-			#		.long	123, ...
-			#		.word	123, ...
-			#		.byte	123, ...
-			#	HAS
-			#		.dc.l	123, ...
-			#		.dc.w	123, ...
-			#		.dc.b	123, ...
-			if ($line =~ /^\s*\.long\s+(.*)/) {
-				my $param = $1;
-				$modified = '	.dc.l ' . modify_args($param, $src_location);
-			}
-			elsif ($line =~ /^\s*\.word\s+(.*)/) {
-				my $param = $1;
-				$modified = '	.dc.w ' . modify_args($param, $src_location);
-			}
-			elsif ($line =~ /^\s*\.byte\s+(.*)/) {
-				my $param = $1;
-				$modified = '	.dc.b ' . modify_args($param, $src_location);
-			}
-			# 文字列リテラルの修正
-			#	m68k_gcc
-			#		.string	"ABC"
-			#	HAS
-			#		.dc.b $41,$42,$43,$00	（末端に \0 が付加される）
-			elsif ($line =~ /^\s*\.string\s+\"(.*)\"/) {
-				my $string	= $1;
-				$modified = convert_string_to_dump($string);
-			}
-			# 文字列リテラルの修正
-			#	m68k_gcc
-			#		.ascii "\b\007\009"
-			#	HAS
-			#		.dc.b $08,$07,$09	（末端に \0 が付加されない）
-			elsif ($line =~ /^\s*\.ascii\s+\"(.*)\"/) {
-				my $string	= $1;
-				$modified = convert_ascii_to_dump($string);
-			}
-			# .globl ディレクティブで指定されているラベル
-			#	m68k_gcc
-			#		.globl inflateBackInit_
-			#	HAS
-			#		.globl _inflateBackInit_
-			elsif ($line =~ /\s*\.globl\s+(.*)/) {
-				my $label = $1;
-				$modified = '	.globl ' . modify_label($label, $src_location);
-			}
-			# .comm ディレクティブ
-			#	m68k_gcc
-			#			.comm	LOCTBL_TOP,16,2
-			#	HAS
-			#			.comm	LOCTBL_TOP,16
-			elsif ($line =~ /\s*\.comm\s+(.*),($g_regex_dec_or_hex),($g_regex_dec_or_hex)/) {
-				my $label = $1;
-				my $size  = $2;
-				my $align = $3;
-				$modified =
-					'	.align ' . $align . "\n"
-				.	'	.comm ' . modify_label($label, $src_location) . ',' . $size;
-			}
-			# .zero ディレクティブ
-			#	m68k_gcc
-			#		.zero	123
-			#	HAS
-			#		.ds.b	16
-			elsif ($line =~ /\s*\.zero\s+($g_regex_dec_or_hex)/) {
-				my $size = $1;
-				$modified = '	.ds.b ' . $size;
-			}
-			# 読み取り専用データ
-			#	m68k_gcc
-			#		.section	.rodata
-			#		.section	.rodata.str1.1
-			#		等々
-			#	HAS
-			#		.data
-			elsif ($line =~ /\s*\.section\s+\.rodata/) {
-				$modified = '	.data';
-			}
-			# BSS セクション
-			#	m68k_gcc
-			#		.section	.bss
-			#	HAS
-			#		.bss
-			elsif ($line =~ /\s*\.section\s+\.bss/) {
-				$modified = '	.bss';
-			}
-			# HAS が認識できないディレクティブの除去
-			#	.local		static なシンボル
-			#	.type		ラベルの用途を指定するデバッグ情報らしい
-			#	.size		詳細不明
-			#	.ident		コンパイラのバージョン情報らしい
-			#	.section	必要なものは個別に認識済み
-			#	.swbeg		詳細不明
-			#	.cfi_...	デバッグ情報らしい
-			elsif ($line =~ /^\s*\.(local\s+|type\s+|size\s+|ident\s+|section\s+|swbeg\s+|cfi_\w+\s+)/) {
-			}
-			# アライメントの指定を修正
-			#	m68k_gcc
-			#		.balignw 2,0x284c
-			#	HAS
-			#		.align 2
-			#
-			# m68k_gcc では、アライメントで発生するパディングの値を
-			# 指定できるようだが、該当する機能が HAS には存在しない。
-			# .align で代用する。
-			elsif ($line =~ /^\s*\.balignw\s+($g_regex_dec_or_hex),(.*)/) {
-				my $align	= $1;
-				my $padding	= $2;
-				$modified = '	.align ' . $align;
-			}
-			# 上記いずれにも該当しないなら変更不要
-			else {
-				$modified = $line;
-			}
-		} else {
-			# movem 命令（制御・可変モード）のレジスタ指定
-			#	m68k_gcc
-			#		movem.l #15360,<ea>
-			#	HAS
-			#		movem.l d3/d4/d5/a3/a4,<ea>
-			if ($line =~ /(^\s*movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
-				my $op		= $1;
-				my $mask	= $2;
-				my $dst		= $3;
-				$modified = $op . ' ' . convert_movem_mask_to_reg_list($mask) . ',' . modify_args($dst, $src_location);
-			}
-			# movem 命令（プレデクリメントモード）のレジスタ指定
-			#	m68k_gcc
-			#		movem.l #15360,-(an)
-			#	HAS
-			#		movem.l d3/d4/d5/a3/a4,-(an)
-			elsif ($line =~ /(^\s*movem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
-				my $op		= $1;
-				my $mask	= $2;
-				my $dst		= $3;
-				$modified = $op . ' ' . convert_movem_mask_to_reg_list(reverse_movem_mask($mask)) . ',' . modify_args($dst, $src_location);
-			}
-			# movem 命令のレジスタ指定
-			#	m68k_gcc
-			#		movem.l <ea>,#1148
-			#	HAS
-			#		movem.l <ea>,d2/d3/d4/d5/d6/a2
-			elsif ($line =~ /(^\s*movem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
-				my $op		= $1;
-				my $src		= $2;
-				my $mask	= $3;
-				$modified = $op . ' ' . modify_args($src, $src_location) . ',' . convert_movem_mask_to_reg_list($mask);
-			}
-			# fmovem 命令（制御・可変モード）のレジスタ指定
-			#	m68k_gcc
-			#		fmovem #0xfc,<ea>
-			#	HAS
-			#		fmovem fp0/fp1/fp2/fp3/fp4/fp5,<ea>
-			#
-			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
-			elsif ($line =~ /(^\s*fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),([^-].*)/) {
-				my $op		= $1;
-				my $mask	= $2;
-				my $dst		= $3;
-				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask)) . ',' . modify_args($dst, $src_location);
-			}
-			# fmovem 命令（プレデクリメントモード）のレジスタ指定
-			#	m68k_gcc
-			#		fmovem #0x3f,-(an)
-			#	HAS
-			#		fmovem.l fp0/fp1/fp2/fp3/fp4/fp5,-(an)
-			#
-			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
-			elsif ($line =~ /(^\s*fmovem(?:\.\w)?)\s+\#($g_regex_dec_or_hex),(-.*)/) {
-				my $op		= $1;
-				my $mask	= $2;
-				my $dst		= $3;
-				$modified = $op . ' ' . convert_fmovem_mask_to_reg_list($mask) . ',' . modify_args($dst, $src_location);
-			}
-			# fmovem 命令のレジスタ指定
-			#	m68k_gcc
-			#		fmovem.l <ea>,#0xfc
-			#	HAS
-			#		fmovem.l <ea>,fp0/fp1/fp2/fp3/fp4/fp5
-			#
-			# マスクのビット並びが movem とは逆配列らしい（解析結果から推測）。
-			elsif ($line =~ /(^\s*fmovem(?:\.\w)?)\s+(.*),\#($g_regex_dec_or_hex)/) {
-				my $op		= $1;
-				my $src		= $2;
-				my $mask	= $3;
-				$modified = $op . ' ' . modify_args($src, $src_location) . ',' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask));
-			}
-			# jXX 命令
-			#	m68k_gcc
-			#		jhi		jls		jcc		jcs		jne		jeq		jvc
-			#		jvs		jpl		jmi		jge		jlt		jgt		jle
-			#		jra
-			#	HAS
-			#		jbhi	jbls	jbcc	jbcs	jbne	jbeq	jbvc
-			#		jbvs	jbpl	jbmi	jbge	jblt	jbgt	jble
-			#		jbra
-			#
-			# HAS では、jcc と bcc を自動選択できる jbcc が使える。
-			elsif ($line =~ /^\s*j(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le|ra)\s+(.*)/) {
-				my $condition	= $1;
-				my $dst			= $2;
-				$modified = '	jb' . $condition . ' ' . modify_args($dst, $src_location);
-			}
-			# fjXX 命令
-			#	m68k_gcc
-			#		fjhi	fjls	fjcc	fjcs	fjne	fjeq	fjvc
-			#		fjvs	fjpl	fjmi	fjge	fjlt	fjgt	fjle
-			#	HAS
-			#		fbhi	fbls	fbcc	fbcs	fbne	fbeq	fbvc
-			#		fbvs	fbpl	fbmi	fbge	fblt	fbgt	fble
-			#
-			# fjbcc のような仕組みは無いようだ。
-			elsif ($line =~ /^\s*fj(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le)\s+(.*)/) {
-				my $condition	= $1;
-				my $dst			= $2;
-				$modified = '	fb' . $condition . ' ' . modify_args($dst, $src_location);
-			}
-			# jsr 命令
-			#	m68k_gcc
-			#		jsr
-			#	HAS
-			#		jbra
-			#
-			# HAS では、jsr と bsr を自動選択できる jbsr が使える。
-			elsif ($line =~ /^\s*jsr\s+(.*)/) {
-				my $dst = $1;
-				$modified = '	jbsr ' . modify_args($dst, $src_location);
-			}
-			# その他の命令
-			#
-			# 命令自体は変換不要だが、オペランドは修正する必要がある。
-			elsif ($line =~ /^\s*(.+)\s+(.*)$/) {
-				my $op		= $1;
-				my $args	= $2;
-				$modified = '	' . $op . ' ' . modify_args($args, $src_location);
-			}
-			# 上記いずれにも該当しないなら変更不要
-			else {
-				$modified = $line;
-			}
-		}
-
-		# 変換前の記述をコメント行として付加
-		{
-			# TAB 整形
-			my $columns = calc_columns($modified);
-			while ($columns < 48) {
-				$columns += 8;
-				$modified .= '	';
-			}
-			$modified .= '	*' . $orig
-		}
-
-		# 1行出力
-		print $fh_output $modified . "\n";
+	# 処理内容を TTY 出力（デバッグ用途）
+	if (DEBUG) {
+		print "input_file_name  $input_file_name\n";
+		print "output_file_name $output_file_name\n";
 	}
 
+	# 出力ファイルオープン
+	my $fh_output = IO::File->new($output_file_name, 'w') or die("ERROR : Cannot open [" . $output_file_name . "].\n");
+
+	# 2 パス処理
+	#	1 パス目：ラベル置換ルール作成
+	#	2 パス目：ラベル置換ルールに従ったコンバートの実行
+	for (my $pass = 1; $pass <= 2; $pass++) {
+		# 入力ファイルオープン
+		my $fh_input  = IO::File->new($input_file_name,  'r') or die("ERROR : Cannot open [" . $input_file_name  . "].\n");
+
+		# 冒頭の定型行を出力
+		if ($pass == 2) {
+			print $fh_output
+					'* NO_APP'
+			."\n".	'RUNS_HUMAN_VERSION	equ	3'
+			."\n".	'	.cpu ' . $cpu_type
+		#	."\n".	'	.include doscall.equ'
+			."\n".	'* X68 GCC Develop'
+			."\n";
+		}
+
+		# 入力ファイル全体を一行ずつ修正
+		my $line;
+		my $line_num;
+		my $asm_mode = 'gas';
+		while ($line = <$fh_input>) {
+			# ソースの位置情報
+			$line_num++;
+			$g_src_location = $input_file_name . ':' . $line_num;
+
+			# 行末改行の除去
+			#	CR LF なテキストを入力した場合、chomp() では行末改行が
+			#	除去しきれない。正規表現で除去する。
+			$line =~ s/[\r\n]*$//g;
+
+			# 修正前の行
+			my $orig = $line;
+
+			# 修正結果の生成先
+			my $modified;
+
+			# 処理内容を TTY 出力（デバッグ用途）
+			if (DEBUG) {
+				print "$g_src_location pass:$pass [" . $line . "]\n";
+			}
+
+			# next で脱出する想定のスコープ
+			{
+				# 冒頭からコメント、もしくはスペースと行末コメント？
+				if ($line =~ /^($g_regex_comment|\s*$g_regex_end)/i) {
+					# NO_APP 行？
+					#	ここより先は inline asm の外であると解釈する。
+					if    ($line =~ /^\s*\#NO_APP$/i) {
+						$asm_mode = 'gas';
+						$modified = '* APP OFF (NO_APP)';
+					}
+					# APP 行？
+					#	ここより先は inline asm の中であると解釈する。
+					elsif ($line =~ /^\s*\#APP$/i) {
+						$asm_mode = 'has';
+						$modified = '* APP ON (APP)';
+					}
+					next;
+				}
+
+				# ラベルまたはシンボル
+				#	: で終わるラベル宣言は、行頭にスペースを許容しなければならない。
+				if (
+					$line =~ /^\s*$g_regex_label_and_symbol\s*\:/i
+				||	(
+						$asm_mode eq 'has'
+					&&	(
+							$line =~ /^\s*$g_regex_has_local_label\s*\:/i
+						||	$line =~ /^\s*$g_regex_label_and_symbol\s*\=/i
+						||	$line =~ /^\s*$g_regex_label_and_symbol\s+$g_regex_symbol_definition_directive{$asm_mode}/i
+						)
+					)
+				) {
+					if (DEBUG) {
+						print "	modify_label_and_symbol_definition [$line] as $asm_mode\n";
+					}
+					$modified = modify_label_and_symbol_definition($line, $asm_mode, $pass);
+					next;
+				}
+
+				# HAS 固有の機能群
+				if ($asm_mode eq 'has') {
+					# HAS のマクロ実行？
+					#	行頭から始まらない、かつ末尾に : が存在しないなら、
+					#	定義済みマクロの実行と見なす。
+					if (
+						$line =~ /^\s+($g_regex_label_and_symbol)(?!\s*\:)/i
+					) {
+						my $symbol = $1;
+						if (symbol_db_exists($symbol)) {
+							# todo : 未対応
+							die("$g_src_location: ERROR: apply_converter failed. macro is not supported yet.\n");
+							$modified = $line;
+							next;
+						}
+					}
+
+					# HAS のマクロ定義？
+					if (
+						$line =~ /^(\s*)($g_regex_label_and_symbol)\s+(\.?macro)(?:\s+(.+?)$g_regex_end)?/i
+					) {
+						my $spaces		= $1;
+						my $symbol		= $2;
+						my $directive	= $3;
+						my $arg_list	= $4;	# 省略可能
+						$modified = $spaces . $symbol . ' ' . $directive . ' ' . $arg_list;
+						symbol_db_register_symbol($symbol);
+						# todo : 未対応
+						die("$g_src_location: ERROR: apply_converter failed. $directive is not supported yet.\n");
+						next;
+					}
+
+					# HAS のループ開始？
+					if (
+						$line =~ /^(\s*)(\.?(?:rept|irpc|irp))(?:\s+(.+?)$g_regex_end)?/i
+					) {
+						my $spaces		= $1;
+						my $directive	= $2;
+						my $arg_list	= $3;	# 省略可能
+						# todo : 未対応
+						die("$g_src_location: ERROR: apply_converter failed. $directive is not supported yet.\n");
+						next;
+					}
+
+					# HAS のマクロ定義およびループ終了？
+					if (
+						$line =~ /^(\s*)(\.?endm)$g_regex_end/i
+					) {
+						my $spaces		= $1;
+						my $directive	= $2;
+						# todo : 未対応
+						die("$g_src_location: ERROR: apply_converter failed. $directive is not supported yet.\n");
+						next;
+					}
+
+					# HAS の条件付きアセンブリ？
+					if (
+						$line =~ /^(\s*)($g_regex_conditional_assembly_directive{$asm_mode})(?:\s+(.+?)$g_regex_end)?/i
+					) {
+						my $spaces		= $1;
+						my $directive	= $2;
+						my $arg_list	= $3;	# 省略可能
+						# todo : 未対応
+						die("$g_src_location: ERROR: apply_converter failed. $directive is not supported yet.\n");
+						next;
+					}
+				}
+
+				# 2 パス目？
+				if ($pass == 2) {
+					# ディレクティブ行？
+					if    ($line =~ /^\s*$g_regex_directive{$asm_mode}/i) {
+						if (DEBUG) {
+							print "	modify_directive [$line] as $asm_mode\n";
+						}
+						$modified = modify_directive($line, $asm_mode);
+						next;
+					}
+					# インストラクション行？
+					elsif ($line =~ /^\s*$g_regex_instruction/i) {
+						if (DEBUG) {
+							print "	modify_instruction [$line] as $asm_mode\n";
+						}
+						$modified = modify_instruction($line, $asm_mode);
+						next;
+					}
+					# 上記いずれにも該当しないならエラー
+					else {
+						die("$g_src_location: ERROR: apply_converter failed to parse [$line] as $asm_mode.\n");
+					}
+				}
+			}	# next; でここを抜ける
+
+			# 2 パス目：コンバート結果の出力
+			if ($pass == 2) {
+				# 変換前の記述をコメントとして付加
+				my $columns = calc_columns($modified);
+				while ($columns < 48) {
+					$columns += 8;
+					$modified .= '	';
+				}
+				$modified .= '	*' . $orig;
+
+				# ファイルに書き出す
+				print $fh_output $modified . "\n";
+			}
+		}
+
+		# 入力ファイルクローズ
+		$fh_input ->close;
+	}
+
+	# 出力ファイルクローズ
 	$fh_output->close;
-	$fh_input ->close;
 }
 
 
@@ -571,15 +967,49 @@ sub normalize_to_dec {
 	my (
 		$val
 	) = @_;
-	if ($val =~ /^0x[0-9a-fA-F]+$/) {
+
+	# 視認性向上のために挿入されている _ を除去する
+	#	0x1234_5678 -> 0x12345678
+	#	0b0101_0101 -> 0b01010101
+	#	等々
+	$val =~ s/_//gi;
+
+	# 16 進数？
+	if    ($val =~ /^$g_regex_hex$/i) {
+		# $ から始まる 16 進数は、0x から始まる 16 進数に置き換える。
+		$val =~ s/^\$/0x/gi;
+
+		# 16 進数 -> 10 進数変換
 		$val = hex($val);
 	}
+	# 8 進数？
+	elsif ($val =~ /^$g_regex_oct$/i) {
+		# @ から始まる 8 進数は、0o から始まる 8 進数に置き換える。
+		$val =~ s/^\@/0o/gi;
+
+		# 8 進数 -> 10 進数変換
+		$val = oct($val);
+	}
+	# 2 進数？
+	elsif ($val =~ /^$g_regex_bin$/i) {
+		# % から始まる 2 進数は、0b から始まる 2 進数に置き換える。
+		$val =~ s/^\%/0b/gi;
+
+		# oct は本来 8 進数 -> 10 進数変換 API だが、0b から始まる文字列を与えると、
+		# 2 進数 -> 10 進数変換が行われる。
+		$val = oct($val);
+	}
+	# 10 進数？
+	elsif ($val =~ /^$g_regex_dec$/i) {
+		# 加工する必要はない
+	}
+
 	return $val;
 }
 
 
 #------------------------------------------------------------------------------
-#	movem 命令のレジスタマスク値にビット並びを反転する
+#	movem 命令のレジスタマスク値のビット並びを反転する
 #
 #	[parameters]
 #		・$mask
@@ -604,7 +1034,7 @@ sub reverse_movem_mask {
 
 
 #------------------------------------------------------------------------------
-#	fmovem 命令のレジスタマスク値にビット並びを反転する
+#	fmovem 命令のレジスタマスク値のビット並びを反転する
 #
 #	[parameters]
 #		・$mask
@@ -674,10 +1104,13 @@ sub convert_fmovem_mask_to_reg_list {
 	) = @_;
 	$mask = normalize_to_dec($mask);
 	my $reg_list;
+
+	# マスクのビット並びが movem とは逆配置になる。
+
 	for (my $i = 0; $i < 8; $i++) {
-		if ($mask & (1 << $i)) {
+		if ($mask & (1 << (7 - $i))) {
 			if ($reg_list ne ''){ $reg_list .= '/' ;}
-			$reg_list .= 'fp' . ($i & 7);
+			$reg_list .= 'fp' . $i;
 		}
 	}
 	return $reg_list;
@@ -685,14 +1118,531 @@ sub convert_fmovem_mask_to_reg_list {
 
 
 #------------------------------------------------------------------------------
-#	ラベルを HAS 形式に修正する
+#	ディレクティブ行を修正する
+#
+#	[parameters]
+#		・$line
+#			ディレクティブ行
+#
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
+#
+#	[return]
+#		HAS 形式のディレクティブ
+#------------------------------------------------------------------------------
+sub modify_directive {
+	my (
+		$line,
+		$asm_mode
+	) = @_;
+	my $modified;
+
+	# GAS モードの場合
+	if ($asm_mode eq 'gas') {
+		# バイナリ埋め込み
+		#	GAS
+		#		.long	123, ...
+		#		.word	123, ...
+		#		.byte	123, ...
+		#	HAS
+		#		.dc.l	123, ...
+		#		.dc.w	123, ...
+		#		.dc.b	123, ...
+		if    ($line =~ /^(\s*)\.long\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.dc.l ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		elsif ($line =~ /^(\s*)\.word\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.dc.w ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		elsif ($line =~ /^(\s*)\.byte\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.dc.b ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# 文字列リテラル
+		#	GAS
+		#		.string	"ABC"
+		#	HAS
+		#		.dc.b $41,$42,$43,$00	（末端に \0 が付加される）
+		# 注：0 バイト長文字列を認識する必要があるので、正規表現は .* を使用。
+		elsif ($line =~ /^(\s*)\.string\s+\"(.*)\"$g_regex_end/i) {
+			my $spaces	= $1;
+			my $string	= $2;
+			$modified = convert_string_to_dump($string);
+		}
+		# 文字列リテラル
+		#	GAS
+		#		.ascii "\b\007\009"
+		#	HAS
+		#		.dc.b $08,$07,$09	（末端に \0 が付加されない）
+		# 注：0 バイト長文字列を認識する必要があるので、正規表現は .* を使用。
+		elsif ($line =~ /^(\s*)\.ascii\s+\"(.*)\"$g_regex_end/i) {
+			my $spaces	= $1;
+			my $string	= $2;
+			$modified = convert_ascii_to_dump($string);
+		}
+		# .globl ディレクティブ
+		#	GAS
+		#		.globl hoge
+		#	HAS
+		#		.globl _hoge
+		elsif ($line =~ /(\s*)\.globl\s+($g_regex_label_and_symbol)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $label	= $2;
+			$modified = $spaces . '.globl ' . symbol_db_translate($label);
+
+			# X68K gcc は main() があるとき .xdef _main と .xref __main を出力する。
+			# .xref __main を出力しないと、libc のリンクに失敗する。
+			# 参考 https://twitter.com/kamadox/status/1477648323184312324
+			if ($label eq 'main') {
+				$modified =
+					"	.xref __main	* workaround for libc.\n"
+				.	$modified;
+			}
+		}
+		# .comm ディレクティブ
+		#	GAS
+		#			.comm	<label>,<size>,<align>
+		#	HAS
+		#			.comm	<label>,<size>,<align>
+		elsif ($line =~ /(\s*)\.comm\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.comm ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# .zero ディレクティブ
+		#	GAS
+		#		.zero	<size>
+		#	HAS
+		#		.ds.b	<size>
+		elsif ($line =~ /(\s*)\.zero\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.ds.b ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# TEXT セクションの開始
+		#	GAS
+		#		.section	.text.startup,"ax",@progbits
+		#		等々。
+		#		.text に後続する文字列は様々なバリエーションがあるようだ。
+		#	HAS
+		#		.text
+		elsif ($line =~ /(\s*)\.section\s+\.text(\..*)?$g_regex_end/i) {
+			my $spaces = $1;
+			$modified = $spaces . '.text';
+		}
+		# DATA セクションの開始
+		#	GAS
+		#		.data
+		#		.section	.rodata
+		#		.section	.rodata.str1.1
+		#		等々
+		#		.rodata に後続する文字列は様々なバリエーションがあるようだ。
+		#	HAS
+		#		.data
+		elsif ($line =~ /(\s*)\.section\s+\.data(\..*)?$g_regex_end/i) {
+			my $spaces = $1;
+			$modified = $spaces . '.data';
+		}
+		elsif ($line =~ /(\s*)\.section\s+\.rodata(\..*)?$g_regex_end/i) {
+			my $spaces = $1;
+			$modified = $spaces . '.data';
+		}
+		# BSS セクションの開始
+		#	GAS
+		#		.section	.bss
+		#		.text や .rodata と同様に .bss に後続文字列が存在する可能性を考慮する。
+		#	HAS
+		#		.bss
+		elsif ($line =~ /(\s*)\.section\s+\.bss(\..*)?$g_regex_end/i) {
+			my $spaces = $1;
+			$modified = $spaces . '.bss';
+		}
+		# アライメントの指定
+		#	GAS
+		#		.align <align>
+		#	HAS
+		#		.align <align>
+		elsif ($line =~ /^(\s*)\.align\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.align ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# アライメントの指定
+		#	GAS
+		#		.balignw <align>,<value>
+		#	HAS
+		#		.align <align>,<value>
+		elsif ($line =~ /^(\s*)\.balignw\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $arg_list	= $2;
+			$modified = $spaces . '.align ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# ソースファイル名指定
+		elsif ($line =~ /^(\s*)\.file\s+\"(.*)\"$g_regex_end/i) {
+			my $spaces	= $1;
+			my $string	= $2;
+			$modified = $spaces . '.file "' . $string . '"';
+		}
+		# HAS と互換のある、引数無しディレクティブ
+		elsif ($line =~ /^\s*\.(text|data)$g_regex_end/i) {
+			$modified = $line;
+		}
+		# HAS が認識できないディレクティブの除去
+		#	.local		static なラベル
+		#	.type		ラベルの用途を指定するデバッグ情報らしい
+		#	.size		デバッグ情報らしい
+		#	.ident		コンパイラのバージョン情報らしい
+		#	.section	必要なものは個別に認識済み
+		#	.swbeg		詳細不明
+		#	.cfi_...	デバッグ情報らしい
+		elsif ($line =~ /^\s*\.(local\s+|type\s+|size\s+|ident\s+|swbeg\s+|cfi_\w+\s+)/i) {
+			# 何も行わない
+		}
+		# 上記いずれにも該当しないならエラー
+		else {
+			die("$g_src_location: ERROR: modify_directive failed to parse [$line] as $asm_mode.\n");
+		}
+	}
+	# HAS モードの場合
+	#	注意：ディレクティブの先頭の . が省略されることを想定。
+	elsif ($asm_mode eq 'has') {
+		# .include <ファイル名>
+		# .insert <ファイル名>
+		#	このディレクティブの引数はファイル名であり、加工してはいけない。
+		if	  ($line =~ /^(\s*)(\.?(?:include|insert))\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $type		= $2;
+			my $filename	= $3;
+			$modified = $spaces . $type . ' ' . $filename;
+		}
+		# .request <ファイル名>[,<ファイル名>…]
+		#	このディレクティブの引数はファイル名であり、加工してはいけない。
+		elsif ($line =~ /^(\s*)(\.?request)\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $type		= $2;
+			my $filenames	= $3;
+			$modified = $spaces . $type . ' ' . $filenames;
+		}
+		# その他のディレクティブ
+		#	ディレクティブ自体は変換不要だが、オペランドは修正する必要がある。
+		elsif ($line =~ /^(\s*)($g_regex_directive{$asm_mode})\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $type		= $2;
+			my $arg_list	= $3;
+			$modified = $spaces . $type . ' ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# その他のディレクティブ（引数無し）
+		elsif ($line =~ /^(\s*)($g_regex_directive{$asm_mode})$g_regex_end/i) {
+			my $spaces	= $1;
+			my $type	= $2;
+			$modified = $spaces . $type;
+		}
+		# 上記いずれにも該当しないならエラー
+		else {
+			die("$g_src_location: ERROR: modify_directive failed to parse [$line] as $asm_mode.\n");
+		}
+	}
+	# 不明なモードならエラー
+	else {
+		die("$g_src_location: ERROR: unknown asm_mode [$asm_mode].\n");
+	}
+
+	return $modified;
+}
+
+
+#------------------------------------------------------------------------------
+#	ラベルまたはシンボル定義行を修正する
+#
+#	[parameters]
+#		・$line
+#			ラベルまたはシンボル定義行
+#
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
+#
+#		・$pass
+#			何パス目？
+#
+#	[return]
+#		HAS 形式のシンボル定義
+#------------------------------------------------------------------------------
+sub modify_label_and_symbol_definition {
+	my (
+		$line,
+		$asm_mode,
+		$pass
+	) = @_;
+	my $modified;
+
+	# HAS のシンボル定義？
+	#	<シンボル> <ディレクティブ> <式>
+	if    (
+		$asm_mode eq 'has'
+	&&	$line =~ /^(\s*)($g_regex_label_and_symbol)\s+($g_regex_symbol_definition_directive{$asm_mode})\s+(.+?)$g_regex_end/i
+	) {
+		my $spaces		= $1;
+		my $symbol		= $2;
+		my $directive	= $3;
+		my $arg			= $4;
+		$modified = $spaces . $symbol . ' ' . $directive . ' ' . $arg;
+		if ($pass == 1) {
+			symbol_db_register_symbol($symbol);
+		}
+	}
+	# HAS のシンボル定義？
+	#	<シンボル> = <式>
+	#	<シンボル> := <式>
+	elsif (
+		$asm_mode eq 'has'
+	&&	$line =~ /^(\s*)($g_regex_label_and_symbol)(\s*\:?\s*\=\s*)(.+?)$g_regex_end/i
+	) {
+		my $spaces	= $1;
+		my $symbol	= $2;
+		my $op		= $3;
+		my $arg		= $4;
+		$modified = $spaces . $symbol . $op . $arg;
+		if ($pass == 1) {
+			symbol_db_register_symbol($symbol);
+		}
+	}
+	# HAS 拡張のローカルラベル宣言行？
+	#	@@:
+	#	1: ～ 9:
+	#	10: ～ 99:	（HAS060 拡張）
+	elsif (
+		$asm_mode eq 'has'
+	&&	$line =~ /^(\s*)($g_regex_has_local_label)\s*\:/i
+	) {
+		my $spaces		= $1;
+		my $local_label	= $2;
+		$modified = $spaces . $local_label . ':';
+	}
+	# ラベル行？
+	elsif (
+		$line =~ /^(\s*)($g_regex_label_and_symbol)\:/i
+	) {
+		my $spaces	= $1;
+		my $label	= $2;
+		my $modified_label = modify_label($label, $asm_mode);
+		$modified = $spaces . $modified_label . ':';
+		if ($pass == 1) {
+			symbol_db_register_label($label, $modified_label);
+		}
+	}
+	# 上記いずれにも該当しないならエラー
+	else {
+		die("$g_src_location: ERROR: modify_label_and_symbol_definition failed to parse [$line] as $asm_mode.\n");
+	}
+
+	return $modified;
+}
+
+
+#------------------------------------------------------------------------------
+#	インストラクション行を修正する
+#
+#	[parameters]
+#		・$line
+#			インストラクション行
+#
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
+#
+#	[return]
+#		HAS 形式のインストラクション
+#------------------------------------------------------------------------------
+sub modify_instruction {
+	my (
+		$line,
+		$asm_mode
+	) = @_;
+	my $modified;
+
+	# GAS モードの場合
+	if ($asm_mode eq 'gas') {
+		# movem 命令（制御・可変モード）
+		#	GAS
+		#		movem.l #15360,<ea>
+		#	HAS
+		#		movem.l d3/d4/d5/a3/a4,<ea>
+		if ($line =~ /^(\s*)(movem$g_regex_opsize?)\s+\#($g_regex_int)\s*,\s*([^-].+?)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			my $mask	= $3;
+			my $dst		= $4;
+			$modified = $spaces . $op . ' ' . convert_movem_mask_to_reg_list($mask) . ',' . modify_arg_list($dst, $asm_mode);
+		}
+		# movem 命令（プレデクリメントモード）
+		#	GAS
+		#		movem.l #15360,-(an)
+		#	HAS
+		#		movem.l d3/d4/d5/a3/a4,-(an)
+		elsif ($line =~ /^(\s*)(movem$g_regex_opsize?)\s+\#($g_regex_int)\s*,\s*(-.+?)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			my $mask	= $3;
+			my $dst		= $4;
+			$modified = $spaces . $op . ' ' . convert_movem_mask_to_reg_list(reverse_movem_mask($mask)) . ',' . modify_arg_list($dst, $asm_mode);
+		}
+		# movem 命令
+		#	GAS
+		#		movem.l <ea>,#1148
+		#	HAS
+		#		movem.l <ea>,d2/d3/d4/d5/d6/a2
+		elsif ($line =~ /^(\s*)(movem$g_regex_opsize?)\s+(.+)\s*,\s*\#($g_regex_int)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			my $src		= $3;
+			my $mask	= $4;
+			$modified = $spaces . $op . ' ' . modify_arg_list($src, $asm_mode) . ',' . convert_movem_mask_to_reg_list($mask);
+		}
+		# fmovem 命令（制御・可変モード）
+		#	GAS
+		#		fmovem #0xfc,<ea>
+		#	HAS
+		#		fmovem fp0/fp1/fp2/fp3/fp4/fp5,<ea>
+		elsif ($line =~ /^(\s*)(fmovem$g_regex_opsize?)\s+\#($g_regex_int)\s*,\s*([^-].+?)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			my $mask	= $3;
+			my $dst		= $4;
+			$modified = $spaces . $op . ' ' . convert_fmovem_mask_to_reg_list($mask) . ',' . modify_arg_list($dst, $asm_mode);
+		}
+		# fmovem 命令（プレデクリメントモード）
+		#	GAS
+		#		fmovem #0x3f,-(an)
+		#	HAS
+		#		fmovem.l fp0/fp1/fp2/fp3/fp4/fp5,-(an)
+		elsif ($line =~ /^(\s*)(fmovem$g_regex_opsize?)\s+\#($g_regex_int)\s*,\s*(-.+?)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			my $mask	= $3;
+			my $dst		= $4;
+			$modified = $spaces . $op . ' ' . convert_fmovem_mask_to_reg_list(reverse_fmovem_mask($mask)) . ',' . modify_arg_list($dst, $asm_mode);
+		}
+		# fmovem 命令
+		#	GAS
+		#		fmovem.l <ea>,#0xfc
+		#	HAS
+		#		fmovem.l <ea>,fp0/fp1/fp2/fp3/fp4/fp5
+		elsif ($line =~ /^(\s*)(fmovem$g_regex_opsize?)\s+(.+)\s*,\s*\#($g_regex_int)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			my $src		= $3;
+			my $mask	= $4;
+			$modified = $spaces . $op . ' ' . modify_arg_list($src, $asm_mode) . ',' . convert_fmovem_mask_to_reg_list($mask);
+		}
+		# jXX 命令
+		#	GAS
+		#		jhi		jls		jcc		jcs		jne		jeq		jvc
+		#		jvs		jpl		jmi		jge		jlt		jgt		jle
+		#		jra
+		#	HAS
+		#		jbhi	jbls	jbcc	jbcs	jbne	jbeq	jbvc
+		#		jbvs	jbpl	jbmi	jbge	jblt	jbgt	jble
+		#		jbra
+		#
+		# HAS では、jcc と bcc を自動選択できる jbcc が使える。
+		elsif ($line =~ /^(\s*)j(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le|ra)\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $condition	= $2;
+			my $dst			= $3;
+			$modified = $spaces . 'jb' . $condition . ' ' . modify_arg_list($dst, $asm_mode);
+		}
+		# fjXX 命令
+		#	GAS
+		#		fjhi	fjls	fjcc	fjcs	fjne	fjeq	fjvc
+		#		fjvs	fjpl	fjmi	fjge	fjlt	fjgt	fjle
+		#	HAS
+		#		fbhi	fbls	fbcc	fbcs	fbne	fbeq	fbvc
+		#		fbvs	fbpl	fbmi	fbge	fblt	fbgt	fble
+		#
+		# fjbcc のような仕組みは無いようだ。
+		elsif ($line =~ /^(\s*)fj(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le)\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $condition	= $2;
+			my $dst			= $3;
+			$modified = $spaces . 'fb' . $condition . ' ' . modify_arg_list($dst, $asm_mode);
+		}
+		# jsr 命令
+		#	GAS
+		#		jsr
+		#	HAS
+		#		jbra
+		#
+		# HAS では、jsr と bsr を自動選択できる jbsr が使える。
+		elsif ($line =~ /^(\s*)jsr\s+(.+?)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $dst		= $2;
+			$modified = $spaces . 'jbsr ' . modify_arg_list($dst, $asm_mode);
+		}
+		# その他の命令
+		elsif ($line =~ /^(\s*)($g_regex_instruction)\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $op			= $2;
+			my $arg_list	= $3;
+			$modified = $spaces . $op . ' ' . modify_arg_list($arg_list, $asm_mode);
+		}
+		# その他の命令（引数無し）
+		elsif ($line =~ /^(\s*)($g_regex_instruction)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			$modified = $spaces . $op;
+		}
+		# 上記いずれにも該当しないならエラー
+		else {
+			die("$g_src_location: ERROR: modify_instruction failed to parse [$line] as $asm_mode.\n");
+		}
+	}
+	# HAS モードの場合
+	elsif ($asm_mode eq 'has') {
+		# その他の命令
+		#	命令自体は変換不要だが、オペランドは修正する必要がある。
+		if    ($line =~ /^(\s*)($g_regex_instruction)\s+(.+?)$g_regex_end/i) {
+			my $spaces		= $1;
+			my $op			= $2;
+			my $arg_list	= $3;
+
+			# HAS モードでも、inline asm の引数として  GAS モードの引数が出現することがある。
+			# そのため、まず GAS モードで modify_arg_list したのち、HAS モードで modify_arg_list する
+			# 必要がある。
+			$modified = $spaces . $op . ' ' . modify_arg_list(modify_register($arg_list, 'gas'), 'has');
+		}
+		# その他の命令（引数無し）
+		elsif ($line =~ /^(\s*)($g_regex_instruction)$g_regex_end/i) {
+			my $spaces	= $1;
+			my $op		= $2;
+			$modified = $spaces . $op;
+		}
+		# 上記いずれにも該当しないならエラー
+		else {
+			die("$g_src_location: ERROR: modify_instruction failed to parse [$line] as $asm_mode.\n");
+		}
+	}
+	# 不明なモードならエラー
+	else {
+		die("$g_src_location: ERROR: unknown asm_mode [$asm_mode].\n");
+	}
+
+	return $modified;
+}
+
+
+#------------------------------------------------------------------------------
+#	ラベルを修正する
 #
 #	[parameters]
 #		・$label
 #			ラベル
 #
-#		・$src_location
-#			ソースの位置情報
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
 #
 #	[return]
 #		HAS 形式のラベル
@@ -700,22 +1650,46 @@ sub convert_fmovem_mask_to_reg_list {
 sub modify_label {
 	my (
 		$label,
-		$src_location
+		$asm_mode
 	) = @_;
-	$label =~ s/\./\?/g;
-	return '_' . $label;
+
+	# GAS モードの場合
+	if ($asm_mode eq 'gas') {
+		#	GAS
+		#		abc
+		#		abc.def
+		#	HAS
+		#		_abc
+		#		abc?def
+
+		# X68K gcc ではラベル名に出現する . を ? に置換する。
+		$label =~ s/\./\?/gi;
+
+		# X68K gcc ではラベル名先頭に _ が付加される。
+		$label = '_' . $label;
+	}
+	# HAS モードの場合
+	elsif ($asm_mode eq 'has') {
+		# 何も行わない
+	}
+	# 不明なモードならエラー
+	else {
+		die("$g_src_location: ERROR: unknown asm_mode [$asm_mode].\n");
+	}
+
+	return $label;
 }
 
 
 #------------------------------------------------------------------------------
-#	レジスタを HAS 形式に修正する
+#	レジスタを修正する
 #
 #	[parameters]
 #		・$register
 #			レジスタ
 #
-#		・$src_location
-#			ソースの位置情報
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
 #
 #	[return]
 #		HAS 形式のレジスタ
@@ -723,38 +1697,73 @@ sub modify_label {
 sub modify_register {
 	my (
 		$register,
-		$src_location
+		$asm_mode
 	) = @_;
 
-	# レジスタ名とオペランドサイズ表記の修正
-	#	m68k_gcc
-	#		%fp0-%fp7
-	#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr %fpcr %fpsr %fpiar
-	#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の ix として出現する）
-	#	HAS
-	#		fp0-fp7
-	#		d0-d7 a0-a7 sp a6 ccr sr fpcr fpsr fpiar
-	#		d0.l d1.w d2.b
-	$register =~ s/%(fp[0-7])/\1/g;
-	$register =~ s/%fpcr/fpcr/g;
-	$register =~ s/%fpsr/fpsr/g;
-	$register =~ s/%fpiar/fpiar/g;
-	$register =~ s/%(d[0-7])\:([bwl])/\1.\2/g;
-	$register =~ s/%(a[0-7])\:([bwl])/\1.\2/g;
-	$register =~ s/%(d[0-7])/\1/g;
-	$register =~ s/%(a[0-7])/\1/g;
-	$register =~ s/%sp/sp/g;
-	$register =~ s/%fp/a6/g;		# 浮動小数レジスタの一部と認識されることを避けるため最後に置換する
-	$register =~ s/%pc/pc/g;
-	$register =~ s/%ccr/ccr/g;
-	$register =~ s/%sr/sr/g;
+	# GAS モードの場合
+	if ($asm_mode eq 'gas') {
+		# レジスタ名とオペランドサイズ表記の修正
+		#	GAS
+		#		%fp0-%fp7
+		#		%d0-%d7 %a0-%a7 %sp %fp %ccr %sr %fpcr %fpsr %fpiar
+		#		%d0:l %d1:w %d2:b （. でなく : であることに注意。pc 相対の Xi として出現する）
+		#	HAS
+		#		fp0-fp7
+		#		d0-d7 a0-a7 sp a6 ccr sr fpcr fpsr fpiar
+		#		d0.l d1.w d2.b
+		#	68020 以降で利用可能なレジスタ省略表記の za0～za7,zd0～zd7,zpc にも対応する。
 
-	# ビットフィールドの修正
-	if ($register =~ /($g_regex_bitfield)/) {
-		my $pre			= $`;
-		my $bitfield	= $1;
-		my $post		= $';
-		$register = $pre . modify_bitfield($bitfield) . $post;
+		$register =~ s/%(z?d[0-7])$g_regex_end_of_name\:([bwl])/\1.\2/gi;
+		$register =~ s/%(z?a[0-7])$g_regex_end_of_name\:([bwl])/\1.\2/gi;
+		$register =~ s/%(z?d[0-7])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(z?a[0-7])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(z?)fp$g_regex_end_of_name/\1a6/gi;
+		$register =~ s/%(z?sp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(ssp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(usp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(z?pc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(sr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(ccr)$g_regex_end_of_name/\1/gi;
+
+		$register =~ s/%(sfc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(dfc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(vbr)$g_regex_end_of_name/\1/gi;
+
+		$register =~ s/%(msp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(isp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(cacr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(caar)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(buscr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(pcr)$g_regex_end_of_name/\1/gi;
+
+		$register =~ s/%(crp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(srp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(tc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(tt[0-1])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(mmusr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(psr)$g_regex_end_of_name/\1/gi;
+
+		$register =~ s/%(urp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(itt[0-1])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(dtt[0-1])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(nc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(dc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(ic)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(bc)$g_regex_end_of_name/\1/gi;
+
+		$register =~ s/%(drp)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(cal)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(val)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(scc)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(ac)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(pcsr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(bad[0-7])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(bac[0-7])$g_regex_end_of_name/\1/gi;
+
+		$register =~ s/%(fp[0-7])$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(fpcr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(fpsr)$g_regex_end_of_name/\1/gi;
+		$register =~ s/%(fpiar)$g_regex_end_of_name/\1/gi;
 	}
 
 	return $register;
@@ -762,94 +1771,14 @@ sub modify_register {
 
 
 #------------------------------------------------------------------------------
-#	ラベル交じりの式を HAS 形式に修正する
-#
-#	[parameters]
-#		・$expression
-#			ラベル交じりの式
-#
-#		・$src_location
-#			ソースの位置情報
-#
-#	[return]
-#		HAS 形式の式
-#------------------------------------------------------------------------------
-sub modify_expression {
-	my (
-		$expression,
-		$src_location
-	) = @_;
-
-	my $input = $expression;
-	my @a_term;
-
-	# 分解と修正
-	while (1) {
-		# レジスタ指定
-		if ($input =~ /^($g_regex_register)/) {
-			$input = $` . $';
-			my $register = $1;
-			push(@a_term, modify_register($register, $src_location));
-			next;
-		}
-
-		# 即値
-		#	pea 1234.w
-		#	のように、数値の後ろに .b .w .l が付加する可能性がある。
-		if ($input =~ /^($g_regex_dec_or_hex)($g_regex_opsize)?/) {
-			$input = $` . $';
-			my $vale = $1;
-			my $field = $2;
-			push(@a_term, $vale . $field);
-			next;
-		}
-
-		# ラベル
-		#	.L123.w
-		#	のように、ラベルの後ろに .b .w .l が付加する可能性がある。
-		#	.L123.O
-		#	のように、途中にドットが割り込む場合もあるので注意。
-		if ($input =~ /^((?:\.|\w)+)/) {
-			$input = $` . $';
-			my $label = $1;
-			my $field;
-			if ($label =~ /^(.*)($g_regex_opsize)$/) {
-				$label = $1;
-				$field = $2;
-			}
-			push(@a_term, modify_label($label, $src_location) . $field);
-			next;
-		}
-
-		# 演算子
-		if ($input =~ /^([\+\-\*\/])/) {
-			$input = $` . $';
-			push(@a_term, $1);
-			next;
-		}
-
-		# 空になったら終了
-		if ($input =~ /^\s*$/) {
-			last;
-		}
-
-		# ここまでたどり着いたらエラー
-		die("$src_location: ERROR: modify_expression failed to parse [$expression].\n");
-	}
-
-	# 再結合
-	return join('', @a_term);
-}
-
-
-#------------------------------------------------------------------------------
-#	ビットフィールドの修正
+#	ビットフィールドを修正する
 #
 #	[parameters]
 #		・$bitfield
+#			ビットフィールド
 #
-#		・$src_location
-#			ソースの位置情報
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
 #
 #	[return]
 #		HAS 形式のビットフィールド
@@ -857,17 +1786,20 @@ sub modify_expression {
 sub modify_bitfield {
 	my (
 		$bitfield,
-		$src_location
+		$asm_mode
 	) = @_;
 
-	# gas では width に 0 が指定可能だが HAS ではエラーになる。代わりに 32 を指定する。
-	if ($bitfield =~ /^\{(?:\#)?(\d+)\:(?:\#)?(\d+)\}$/) {
-		my $offset	= $1;
-		my $width	= $2;
-		if ($width == 0) {
-			$width = 32;
+	# GAS モードの場合
+	if ($asm_mode eq 'gas') {
+		# gas では width に 0 が指定可能だが HAS ではエラーになる。代わりに 32 を指定する。
+		if ($bitfield =~ /^\{(?:\#)?($g_regex_int)\:(?:\#)?($g_regex_int)\}$/i) {
+			my $offset	= $1;
+			my $width	= $2;
+			if ($width == 0) {
+				$width = 32;
+			}
+			$bitfield = "{\#$offset:\#$width}";
 		}
-		$bitfield = "{\#$offset:\#$width}";
 	}
 
 	return $bitfield;
@@ -875,219 +1807,433 @@ sub modify_bitfield {
 
 
 #------------------------------------------------------------------------------
-#	引数リストを HAS 形式に修正する
+#	アドレッシング引数を修正する
 #
 #	[parameters]
-#		・$args
-#			数式交じりの引数リスト
+#		・$arg
+#			引数
 #
-#		・$src_location
-#			ソースの位置情報
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
+#
+#	[return]
+#		HAS 形式のアドレッシング引数
+#------------------------------------------------------------------------------
+sub modify_addressing_arg {
+	my (
+		$arg,
+		$asm_mode
+	) = @_;
+	my $modified;
+
+	# レジスタ？
+	if    ($arg =~ /^($g_regex_register{$asm_mode}{'all'})$/i) {
+		my $register = $1;
+		$modified = modify_register($register, $asm_mode);
+	}
+	# Xi？
+	elsif ($arg =~ /^($g_regex_register{$asm_mode}{'xi'})$/i) {
+		my $xi = $1;
+		$modified = modify_register($xi, $asm_mode);
+	}
+	# 式？
+	elsif ($arg =~ /^($g_regex_expression{$asm_mode})$/i) {
+		my $expression = $1;
+		$modified = $expression;
+	}
+	# 省略？
+	elsif ($arg eq '') {
+		$modified = '';
+	}
+	# 上記いずれにも該当しないならエラー
+	else {
+		die("$g_src_location: ERROR: modify_addressing_arg failed to parse [$arg] as $asm_mode.\n");
+	}
+
+	return $modified;
+}
+
+
+#------------------------------------------------------------------------------
+#	引数リストを修正する
+#
+#	[parameters]
+#		・$arg_list
+#			引数リスト
+#
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
 #
 #	[return]
 #		HAS 形式の引数リスト
 #------------------------------------------------------------------------------
-sub modify_args {
+sub modify_arg_list {
 	my (
-		$args,
-		$src_location
+		$arg_list,
+		$asm_mode
 	) = @_;
 	my @a_modified_arg;
 
-	# 引数リストをひとつずつ認識して除去していく
-	#	評価順序を慎重に設定する必要がある。
-	#	例えば、(an) は (an)+ や -(an) にもマッチしてしまうので、
-	#	後から評価する必要がある。
-	my $input = $args;
 	if (DEBUG) {
-		print "args : [" . $args . "]\n";
+		print "		modify_arg_list [" . $arg_list . "]\n";
 	}
-	for (my $i = 0; $i < 2; $i++) {
-		# 冒頭のスペースを除去
-		$input =~ s/^\s*//g;
 
-		# 第二引数以降は、冒頭のカンマ列を除去
-		if ($i != 0) {
-			if ($input ne '') {
-				if (!($input =~ s/^,//g)) {
-					die("$src_location: ERROR: modify_args failed to parse [$args].\n");
-				}
-			}
-		}
+	# 引数リストを分解＆修正
+	my @a_arg = split_and_modify_arg_list($arg_list, $asm_mode);
+
+	# 引数リストを巡回
+	foreach (@a_arg) {
+		my $arg = $_;
+
+		# 以下のアドレッシングモードをサポートする必要がある。
+		#
+		#	Dn						ビットフィールド対応
+		#	An
+		#	(An)					ビットフィールド対応
+		#	(An)+
+		#	-(An)
+		#	d(An)					ビットフィールド対応
+		#	d(An,Xi)				ビットフィールド対応
+		#	(bd,An,Xi)				ビットフィールド対応
+		#	([bd,An],Xi,od)			ビットフィールド対応
+		#	([bd,An,Xi],od)			ビットフィールド対応
+		#	address(PC)
+		#	address(PC,Xi)
+		#	(address,PC,Xi)
+		#	([address,PC],Xi,od)
+		#	([address,PC,Xi],od)
+		#	(xxxx).W				ビットフィールド対応
+		#	(xxxx).L				ビットフィールド対応
+		#	#xxxx
+		#
+		# 引数は省略可能なため、実際にはもっと多くのバリエーションが存在する。
+		# 省略形を含めた全てのパターンを正規表現で認識するのは非常に煩雑である。
+		# ここでは問題を単純化するため、以下のようなバリエーションと見なす。
+		#
+		#	Dn						ビットフィールド対応
+		#	An
+		#	(An)					ビットフィールド対応
+		#	(An)+
+		#	-(An)
+		#	expression(arg1,arg2)	ビットフィールド対応
+		#	expression(arg1)		ビットフィールド対応
+		#	(arg1,arg2,arg3)		ビットフィールド対応
+		#	(arg1,arg2)				ビットフィールド対応
+		#	(arg1)					ビットフィールド対応
+		#	([arg1,arg2,arg3],arg4)	ビットフィールド対応
+		#	([arg1,arg2,arg3])		ビットフィールド対応
+		#	([arg1,arg2],arg3,arg4)	ビットフィールド対応
+		#	([arg1,arg2],arg3)		ビットフィールド対応
+		#	([arg1,arg2])			ビットフィールド対応
+		#	([arg1],arg2,arg3)		ビットフィールド対応
+		#	([arg1],arg2)			ビットフィールド対応
+		#	([arg1])				ビットフィールド対応
+		#	(xxxx).W				ビットフィールド対応
+		#	(xxxx).L				ビットフィールド対応
+		#	#xxxx
+		#
+		# arg1～ は、Dn An Xi PC d bd address にマッチするものとする。
+		# expression は、d bd address にマッチするものとする。
+		# 結果的に曖昧なマッチングになるが、HAS も同様の対応を取っているようなので
+		# 問題は無いし、HAS との互換性も向上する。
+		#
+		#
+		# GAS の表記には、MIT syntax と Motorola syntax の二通りが存在する。
+		# Motorola syntax は HAS と互換があるが、MIT syntax は互換がない。
+		# m68k-elf-gcc は、極まれに MIT syntax を出力する場合がある。
+		#
+		#										MIT syntax									Motorola syntax
+		#	Address Register Indirect			%a0@ ～ %a7@								(%a0) ～ (%a7)
+		#	Address Register Postincrement		%a0@+ ～ %a7@+								(%a0)+ ～ (%a7)+
+		#	Address Register Predecrement		%a0@- ～ %a7@-								-(%a0) ～ -(%a7)
+		#	Indirect Plus Offset				apc@(number)								number(apc)
+		#	Index								apc@(number,register:size:scale)			number(apc,register.size*scale)
+		#	Postindex							apc@(number)@(onumber,register:size:scale)	([number,apc],register.size*scale,onumber)
+		#	Preindex							apc@(number,register:size:scale)@(onumber)	([number,apc,register.size*scale],onumber)
+		#	※apc とは、An または PC を意味する。
 
 		# レジスタ
-		if (
-			$input =~ /^($g_regex_register)/
+		if    (
+			$arg =~ /^($g_regex_register{$asm_mode}{'all'})($g_regex_bitfield)?$/i
 		) {
-			$input = $` . $';
-			my $register = $1;
-			my $modified_arg = modify_register($register, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as register\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# abs(ix) : -m68030 指定時に出現
-		elsif (
-			$input =~ /^($g_regex_expression)\(($g_regex_ix)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $register	= $2;
-			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as abs(ix)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# %pc@(d8,ix)
-		elsif (
-			$input =~ /^%pc@\(($g_regex_expression),($g_regex_ix)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $ix			= $2;
-			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as %pc@(d8,ix)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# (an)+
-		elsif (
-			$input =~ /^\(($g_regex_an)\)\+/
-		) {
-			$input = $` . $';
-			my $register = $1;
-			my $modified_arg = '(' . modify_register($register, $src_location) . ')+';
-			if (DEBUG) {
-				print "	arg [$modified_arg] as (an)+\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# -(an)
-		elsif (
-			$input =~ /^\-\(($g_regex_an)\)/
-		) {
-			$input = $` . $';
-			my $register = $1;
-			my $modified_arg = '-(' . modify_register($register, $src_location) . ')';
-			if (DEBUG) {
-				print "	arg [$modified_arg] as -(an)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# d16(an)
-		elsif (
-			$input =~ /^($g_regex_expression)\(($g_regex_an)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $register	= $2;
-			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as d16(an)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# (d16,an)
-		elsif (
-			$input =~ /^\(($g_regex_expression),($g_regex_an)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $register	= $2;
-			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as (d16, an)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# d8(an,ix)
-		elsif (
-			$input =~ /^($g_regex_expression)\(($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $register	= $2;
-			my $ix			= $3;
-			my $bitfield	= $4;
-			my $modified_arg = modify_expression($expression, $src_location) . '(' . modify_register($register, $src_location) . ',' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as d8(an,ix)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# (d8,an,ix)
-		elsif (
-			$input =~ /^\(($g_regex_expression),($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $register	= $2;
-			my $ix			= $3;
-			my $bitfield	= $4;
-			my $modified_arg = '(' . modify_expression($expression, $src_location) . ',' . modify_register($register, $src_location) . ',' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as (d8,an,ix)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# d8(pc,ix)
-		elsif (
-			$input =~ /^($g_regex_expression)\(%pc,($g_regex_ix)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
-			my $expression	= $1;
-			my $ix			= $2;
-			my $bitfield	= $3;
-			my $modified_arg = modify_expression($expression, $src_location) . '(pc,' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
-			if (DEBUG) {
-				print "	arg [$modified_arg] as d8(pc,ix)\n";
-			}
-			push(@a_modified_arg, $modified_arg);
-		}
-		# (an)
-		elsif (
-			$input =~ /^\(($g_regex_an)\)($g_regex_bitfield)?/
-		) {
-			$input = $` . $';
 			my $register	= $1;
 			my $bitfield	= $2;
-			my $modified_arg = '(' . modify_register($register, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
+			my $modified_arg = modify_register($register, $asm_mode) . $bitfield;
 			if (DEBUG) {
-				print "	arg [$modified_arg] as (an)\n";
+				print "			arg [$arg -> $modified_arg] as register\n";
 			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# (an,ix)
+		# (An)
 		elsif (
-			$input =~ /^\(($g_regex_an),($g_regex_ix)\)($g_regex_bitfield)?/
+			$arg =~ /^\(($g_regex_register{$asm_mode}{'an'})\)($g_regex_bitfield)?$/i
 		) {
-			$input = $` . $';
-			my $register	= $1;
-			my $ix			= $2;
-			my $bitfield	= $3;
-			my $modified_arg = '(' . modify_register($register, $src_location) . ',' . modify_register($ix, $src_location) . ')' . modify_bitfield($bitfield, $src_location);
+			my $an			= $1;
+			my $bitfield	= $2;
+			my $modified_arg = '(' . modify_register($an, $asm_mode) . ')' . $bitfield;
 			if (DEBUG) {
-				print "	arg [$modified_arg] as (an,ix)\n";
+				print "			arg [$arg -> $modified_arg] as (An)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# (An)+
+		elsif (
+			$arg =~ /^\(($g_regex_register{$asm_mode}{'an'})\)\+$/i
+		) {
+			my $an = $1;
+			my $modified_arg = '(' . modify_register($an, $asm_mode) . ')+';
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as (An)+\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# -(An)
+		elsif (
+			$arg =~ /^\-\(($g_regex_register{$asm_mode}{'an'})\)$/i
+		) {
+			my $an = $1;
+			my $modified_arg = '-(' . modify_register($an, $asm_mode) . ')';
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as -(An)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# expression(arg1,arg2)
+		#	arg1,arg2 は省略可能
+		elsif (
+			$arg =~ /^($g_regex_expression{$asm_mode})\(($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $expression	= $1;
+			my $arg1		= $2;
+			my $arg2		= $3;
+			my $bitfield	= $4;
+			my $modified_arg = $expression . '(' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as expression(arg1,arg2)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# expression(arg1)
+		elsif (
+			$arg =~ /^($g_regex_expression{$asm_mode})\(($g_regex_addressing_arg{$asm_mode})\)($g_regex_bitfield)?$/i
+		) {
+			my $expression	= $1;
+			my $arg1		= $2;
+			my $bitfield	= $3;
+			my $modified_arg = $expression . '(' . modify_addressing_arg($arg1, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as expression(arg1)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# (arg1,arg2,arg3)
+		#	arg1,arg2,arg3 は省略可能
+		elsif (
+			$arg =~ /^\(($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $arg3		= $3;
+			my $bitfield	= $4;
+			my $modified_arg = '(' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . ',' . modify_addressing_arg($arg3, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as (arg1,arg2,arg3)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# (arg1,arg2)
+		#	arg1,arg2 は省略可能
+		elsif (
+			$arg =~ /^\(($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $bitfield	= $3;
+			my $modified_arg = '(' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as (arg1,arg2)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# (arg1)
+		elsif (
+			$arg =~ /^\(($g_regex_addressing_arg{$asm_mode})\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $bitfield	= $2;
+			my $modified_arg = '(' . modify_addressing_arg($arg1, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as (arg1)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1,arg2,arg3],arg4)
+		#	arg1,arg2,arg3,arg4 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\],($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $arg3		= $3;
+			my $arg4		= $4;
+			my $bitfield	= $5;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . ',' . modify_addressing_arg($arg3, $asm_mode) . '],' . modify_addressing_arg($arg4, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1,arg2,arg3],arg4)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1,arg2,arg3])
+		#	arg1,arg2,arg3 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\]\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $arg3		= $3;
+			my $bitfield	= $4;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . ',' . modify_addressing_arg($arg3, $asm_mode) . '])' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1,arg2,arg3])\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1,arg2],arg3,arg4)
+		#	arg1,arg2,arg3,arg4 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\],($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $arg3		= $3;
+			my $arg4		= $4;
+			my $bitfield	= $5;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . '],' . modify_addressing_arg($arg3, $asm_mode) . ',' . modify_addressing_arg($arg4, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1,arg2],arg3,arg4)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1,arg2],arg3)
+		#	arg1,arg2,arg3 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\],($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $arg3		= $3;
+			my $bitfield	= $4;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . '],' . modify_addressing_arg($arg3, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1,arg2],arg3)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1,arg2])
+		#	arg1,arg2 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\]\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $bitfield	= $3;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . ',' . modify_addressing_arg($arg2, $asm_mode) . '])' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1,arg2])\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1],arg2,arg3)
+		#	arg1,arg2,arg3 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?\],($g_regex_addressing_arg{$asm_mode})?,($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $arg3		= $3;
+			my $bitfield	= $4;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . '],' . modify_addressing_arg($arg2, $asm_mode) . ',' . modify_addressing_arg($arg3, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1],arg2,arg3)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1],arg2)
+		#	arg1,arg2 は省略可能
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})?\],($g_regex_addressing_arg{$asm_mode})?\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $arg2		= $2;
+			my $bitfield	= $3;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . '],' . modify_addressing_arg($arg2, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1],arg2)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# ([arg1])
+		elsif (
+			$arg =~ /^\(\[($g_regex_addressing_arg{$asm_mode})\]\)($g_regex_bitfield)?$/i
+		) {
+			my $arg1		= $1;
+			my $bitfield	= $2;
+			my $modified_arg = '([' . modify_addressing_arg($arg1, $asm_mode) . '])' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as ([arg1])\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# pc@(address,Xi)
+		#	GAS 固有の MIT syntax である。
+		#	m68k-elf-gcc は唯一このアドレッシングのみ MIT syntax で出力してくる。
+		elsif (
+			$asm_mode eq 'gas'
+		&&	$arg =~ /^($g_regex_register{$asm_mode}{'pc'})@\(($g_regex_expression{$asm_mode}),($g_regex_register{$asm_mode}{'xi'})\)($g_regex_bitfield)?$/i
+		) {
+			my $pc			= $1;
+			my $address		= $2;
+			my $xi			= $3;
+			my $bitfield	= $4;
+			my $modified_arg = $address . '(' . modify_register($pc, $asm_mode) . ',' . modify_register($xi, $asm_mode) . ')' . $bitfield;
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as pc@(address,Xi)\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# movem レジスタリスト
+		#	レジスタリストに 1 要素しかない場合、レジスタ単体指定と区別ができない。
+		#	ビットフィールドが後続する場合は、レジスタ単体指定と見なし、マッチをキャンセルする。
+		elsif (
+			$arg =~ /^($g_regex_register{$asm_mode}{'movem_reg_list'})(?!$g_regex_bitfield)$/i
+		) {
+			my $reg_list = $1;
+			my $modified_arg = modify_register($reg_list, $asm_mode);
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as movem_reg_list\n";
+			}
+			push(@a_modified_arg, $modified_arg);
+		}
+		# fmovem レジスタリスト
+		elsif (
+			$arg =~ /^($g_regex_register{$asm_mode}{'fmovem_reg_list'})$/i
+		) {
+			my $reg_list = $1;
+			my $modified_arg = modify_register($reg_list, $asm_mode);
+			if (DEBUG) {
+				print "			arg [$arg -> $modified_arg] as fmovem_reg_list\n";
 			}
 			push(@a_modified_arg, $modified_arg);
 		}
 		# #imm
 		elsif (
-			$input =~ /^\#($g_regex_expression)/
+			$arg =~ /^\#($g_regex_expression{$asm_mode})$/i
 		) {
-			$input = $` . $';
 			my $expression = $1;
 			my $modified_arg;
 
 			# 9 桁を超える 16 進数は、8 桁ごとに分割して再帰呼出し
-			if ($expression =~ /^0x([0-9a-fA-F]{9,})$/) {
+			if ($expression =~ /^0x([0-9a-fA-F]{9,})$/i) {
 				my $hex = $1;
 				my $split_hex;
 				for (my $i = 0; $hex ne ''; $i++) {
@@ -1096,77 +2242,284 @@ sub modify_args {
 					}
 
 					# 8 桁まとめて切り出す
-					if ($hex =~ /^([0-9a-fA-F]{8})/ ) {
+					if ($hex =~ /^([0-9a-fA-F]{8})/i) {
 						$split_hex .= '#0x' . $1;
 						$hex = $` . $';
 					}
 					# 8 桁未満をまとめて切り出す
-					elsif ($hex =~ /^([0-9a-fA-F]{1,7})/ ) {
+					elsif ($hex =~ /^([0-9a-fA-F]{1,7})/i) {
 						$split_hex .= '#0x' . $1;
 						$hex = $` . $';
 					}
 					# エラー
 					elsif ($hex ne '') {
-						die("$src_location: ERROR: modify_args failed to parse [$expression] as hex.\n");
+						die("$g_src_location: ERROR: modify_arg_list failed to parse [$expression] as $asm_mode hex.\n");
 					}
 				}
 
 				# 再帰呼出し
-				$modified_arg = modify_args($split_hex, $src_location);
+				$modified_arg = modify_arg_list($split_hex, $asm_mode);
 			}
 			else {
-				$modified_arg = '#' . modify_expression($expression, $src_location);
+				$modified_arg = '#' . $expression;
 			}
 
 			if (DEBUG) {
-				print "	arg [$modified_arg] as #imm\n";
+				print "			arg [$arg -> $modified_arg] as #imm\n";
 			}
 			push(@a_modified_arg, $modified_arg);
 		}
 		# 数値またはラベル名または式
 		elsif (
-			$input =~ /^($g_regex_expression)($g_regex_bitfield)?/
+			$arg =~ /^($g_regex_expression{$asm_mode})($g_regex_bitfield)?$/i
 		) {
-			$input = $` . $';
 			my $expression	= $1;
 			my $bitfield	= $2;
-			my $modified_arg = modify_expression($expression, $src_location) . modify_bitfield($bitfield, $src_location);
+			my $modified_arg = $expression . $bitfield;
 			if (DEBUG) {
-				print "	arg [$modified_arg] as expression\n";
+				print "			arg [$arg -> $modified_arg] as expression\n";
 			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# 数値またはラベル名または式（括弧つき）
+		# (xxxx).W (xxxx).L
+		#	(arg1) の一部と誤認識されることを避けるため、先に評価する。
 		elsif (
-			$input =~ /^\(($g_regex_expression)\)($g_regex_opsize)?($g_regex_bitfield)?/
+			$arg =~ /^\(($g_regex_expression{$asm_mode})\)($g_regex_opsize)?($g_regex_bitfield)?$/i
 		) {
-			$input = $` . $';
 			my $expression	= $1;
 			my $opsize		= $2;
 			my $bitfield	= $3;
-			my $modified_arg = '(' . modify_expression($expression, $src_location) . $opsize . ')' . modify_bitfield($bitfield, $src_location);
+			my $modified_arg = '(' . $expression . ')' . $opsize . $bitfield;
 			if (DEBUG) {
-				print "	arg [$modified_arg] as (expression)\n";
+				print "			arg [$arg -> $modified_arg] as (expression)\n";
 			}
 			push(@a_modified_arg, $modified_arg);
 		}
-		# 検出できないならループを抜ける
+		# 上記いずれにも該当しないならエラー
 		else {
-			last;
+			die("$g_src_location: ERROR: modify_arg_list failed to parse [$arg_list] as $asm_mode.\n");
 		}
-	}
-
-	# 冒頭のスペースとカンマ列を除去
-	$input =~ s/^(\s|,)*//g;
-
-	# すべて分解しきれていないならエラー
-	if ($input ne '') {
-		die("$src_location: ERROR: modify_args failed to parse [$args].\n");
 	}
 
 	# 修正引数リストの結合
 	my $modified_arg = join(',', @a_modified_arg);
 	return $modified_arg;
+}
+
+
+#------------------------------------------------------------------------------
+#	引数リストを分解＆修正する
+#
+#	[parameters]
+#		・$arg_list
+#			引数リスト
+#
+#		・$asm_mode
+#			アセンブラモード（'gas' または 'has'）
+#
+#	[return]
+#		HAS 形式の引数配列
+#
+#	[remarks]
+#		ビットフィールドの修正と、ラベル置換が適用される。
+#------------------------------------------------------------------------------
+sub split_and_modify_arg_list {
+	my (
+		$arg_list,
+		$asm_mode
+	) = @_;
+	my @a_split_arg;
+	my $orig = $arg_list;
+
+	# 括弧のネスト認識用スタック 
+	my @a_stack;
+
+	# 引数分解結果
+	my $arg;
+
+	# 直前のステート
+	my $state;
+
+	# 行末コメントとスペースを除去
+	$arg_list =~ s/$g_regex_line_end_comment//gi;
+	$arg_list =~ s/\s*//gi;
+
+	# 引数リストが空になるまで分解
+	while ($arg_list ne '') {
+		# オペランドサイズ？
+		if    (
+			$arg_list =~ /^($g_regex_opsize)/i
+		&&	# 許容する直前の文字
+			(	$state eq 'label'
+			||	$state eq 'register'
+			||	$state eq 'number'
+			||	$state eq ')'
+			)
+		) {
+			$arg_list = $';
+			my $opsize = $1;
+			$arg .= $opsize;
+			$state = 'opsize';
+		}
+		# レジスタ？
+		elsif ($arg_list =~ /^($g_regex_register{$asm_mode}{'all'})/i) {
+			$arg_list = $';
+			my $register = $1;
+
+			# ここで modify_register したくなるが、GAS レジスタの % が除去されると
+			# レジスタと同名のラベルと区別が付かなくなってしまう。
+			# modify_register 適用は最後に行う。
+
+			$arg .= $register;
+			$state = 'register';
+		}
+		# ビットフィールド？
+		elsif ($arg_list =~ /^($g_regex_bitfield)/i) {
+			$arg_list = $';
+			my $bitfield = $1;
+			$arg .= modify_bitfield($bitfield, $asm_mode);
+			$state = 'bitfield';
+		}
+		# 数字？
+		elsif ($arg_list =~ /^($g_regex_number)/i) {
+			$arg_list = $';
+			my $number = $1;
+			$arg .= $number;
+			$state = 'number';
+		}
+		# 演算子？
+		elsif ($arg_list =~ /^($g_regex_operator{$asm_mode})/i) {
+			$arg_list = $';
+			my $operator = $1;
+			$arg .= $operator;
+			$state = 'operator';
+		}
+		# HAS のローカルラベル？
+		#	ローカルラベルに含まれる @ が項の境界と見なされてしまうので、
+		#	ここでローカルラベル全体を認識して取り除く。
+		elsif (
+			$asm_mode eq 'has'
+		&&	$arg_list =~ /^($g_regex_ref_has_local_label)/i
+		) {
+			$arg_list = $';
+			my $local_label = $1;
+			$arg .= $local_label;
+			$state = 'local_label';
+		}
+		# オペランドサイズを含んだラベル（またはシンボル）？
+		#	オペランドサイズを含まずラベルのみにマッチさせるのは難しい。
+		#	ここではオペランドサイズ混みでマッチしたのち、オペランドサイズを
+		#	分離する方法で実装している。
+		elsif ($arg_list =~ /^($g_regex_label_and_symbol$g_regex_opsize?)/i) {
+			$arg_list = $';
+			my $label_with_opsize = $1;
+
+			# ラベルとオペランドサイズに分解し、ラベル部のみ置換
+			if ($label_with_opsize =~ /(.*)($g_regex_opsize)/i) {
+				my $label	= $1;
+				my $opsize	= $2;
+				$arg .= symbol_db_translate($label) . $opsize;
+				$state = 'opsize';
+			} else {
+				$arg .= symbol_db_translate($label_with_opsize);
+				$state = 'label';
+			}
+		}
+		# 項の境界、または終点？
+		#	括弧
+		#	即値の \#
+		#	MIT syntax で出現する \@
+		elsif ($arg_list =~ /^([\(\)\{\}\[\]\#\@,]|$)/i) {
+			$arg_list = $';
+			my $char = $1;
+			$state = $char;
+
+			# カンマ？
+			if ($char eq ',') {
+				# 最下段にいるなら引数境界と見なす
+				my $n_stack = @a_stack;
+				if ($n_stack == 0) {
+					# 引数分解結果を push
+					push(@a_split_arg, $arg);
+					$arg = '';
+				} else {
+					$arg .= $char;
+				}
+			} else {
+				$arg .= $char;
+
+				# 小括弧開く？
+				if    ($char eq '(') {
+					push(@a_stack, $char);
+				}
+				# 小括弧閉じる？
+				elsif ($char eq ')') {
+					if (pop(@a_stack) ne '(') {
+						die("$g_src_location: ERROR: split_and_modify_arg_list failed to parse [$arg_list].\n");
+					}
+				}
+				# 中括弧開く？
+				elsif ($char eq '{') {
+					push(@a_stack, $char);
+				}
+				# 中括弧閉じる？
+				elsif ($char eq '}') {
+					if (pop(@a_stack) ne '{') {
+						die("$g_src_location: ERROR: split_and_modify_arg_list failed to parse [$arg_list].\n");
+					}
+				}
+				# 大括弧開く？
+				elsif ($char eq '[') {
+					push(@a_stack, $char);
+				}
+				# 大括弧閉じる？
+				elsif ($char eq ']') {
+					if (pop(@a_stack) ne '[') {
+						die("$g_src_location: ERROR: split_and_modify_arg_list failed to parse [$arg_list].\n");
+					}
+				}
+				# 上記以外
+				else {
+					# 何も行わない
+				}
+			}
+		}
+		# 上記以外
+		else {
+			# ここにたどり着くことはない
+			die("$g_src_location: ERROR: unknown arg_list $arg_list");
+		}
+	}
+
+	# 引数分解結果を push
+	push(@a_split_arg, $arg);
+# print "split_and_modify_arg_list [$orig] -> [" . join(" / ", @a_split_arg) . "]\n";
+
+	return @a_split_arg;
+}
+
+
+#------------------------------------------------------------------------------
+#	引数リストを分解し、スペースを除去する
+#
+#	[parameters]
+#		・$arg_list
+#			引数リスト
+#
+#	[return]
+#		引数配列
+#------------------------------------------------------------------------------
+sub split_and_strip_arg_list {
+	my (
+		$arg_list
+	) = @_;
+
+	# 行末コメントとスペースを除去
+	$arg_list =~ s/$g_regex_line_end_comment//gi;
+	$arg_list =~ s/\s*//gi;
+
+	# 引数リストを配列に分解
+	return split(',', $arg_list);
 }
 
 
@@ -1204,7 +2557,7 @@ sub convert_ascii_to_dump {
 	my $dump;
 
 	my @decoded = decode_escape_sequence($string);
-	my $n = $#decoded + 1;
+	my $n = @decoded;
 	my $n_per_line = 8;
 	for (my $i = 0; $i < $n; $i += $n_per_line) {
 		my $begin = $i;
@@ -1238,7 +2591,7 @@ sub decode_escape_sequence {
 
 	# 1 文字単位に分解
 	my @chars = split('', $string);
-	my $n = $#chars + 1;
+	my $n = @chars;
 
 	# デコード
 	my @decoded;
@@ -1253,7 +2606,7 @@ sub decode_escape_sequence {
 			elsif ($chars[$i + 1] eq 'f') { push(@decoded, '$0c'); $i += 1; }
 			elsif ($chars[$i + 1] eq 'r') { push(@decoded, '$0d'); $i += 1; }
 			elsif ($chars[$i + 1] eq '\\'){ push(@decoded, '$5c'); $i += 1; }
-			# 3桁8進数エンコード
+			# 3 桁 8 進数エンコード
 			elsif ('0' <= $chars[$i + 1] && $chars[$i + 1] <= '9') {
 				push(@decoded, '$' . sprintf("%02x", oct($chars[$i + 1] . $chars[$i + 2] . $chars[$i + 3])));
 				$i += 3;
@@ -1295,6 +2648,139 @@ sub calc_columns {
 	}
 
 	return $columns;
+}
+
+
+#------------------------------------------------------------------------------
+#	シンボルデータベースにシンボル登録
+#
+#	[parameters]
+#		・$key
+#			シンボル
+#------------------------------------------------------------------------------
+sub symbol_db_register_symbol {
+	my (
+		$key
+	) = @_;
+	$g_symbol_db{'stack'}[$g_symbol_db{'depth'}]{$key} = $key;
+	if (DEBUG) {
+		print "symbol_db_register_symbol : $key\n";
+	}
+}
+
+
+#------------------------------------------------------------------------------
+#	シンボルデータベースにラベル置換ルールを登録
+#
+#	[parameters]
+#		・$key
+#			ラベル置換元
+#
+#		・$value
+#			ラベル置換先
+#------------------------------------------------------------------------------
+sub symbol_db_register_label {
+	my (
+		$key,
+		$value
+	) = @_;
+	$g_symbol_db{'stack'}[$g_symbol_db{'depth'}]{$key} = $value;
+	if (DEBUG) {
+		print "symbol_db_register_label : $key -> $value\n";
+	}
+}
+
+
+#------------------------------------------------------------------------------
+#	シンボルデータベースのラベル置換ルールに従い置換
+#
+#	[parameters]
+#		・$key
+#			ラベル置換元
+#	
+#	[return]
+#		ラベル置換先
+#------------------------------------------------------------------------------
+sub symbol_db_translate {
+	my (
+		$key
+	) = @_;
+
+	# 置換ルールに登録されているか？
+	for (my $depth = $g_symbol_db{'depth'}; $depth >= 0; $depth--) {
+		if (defined($g_symbol_db{'stack'}[$depth]{$key})) {
+			return $g_symbol_db{'stack'}[$depth]{$key};
+		}
+	}
+
+	# GAS 形式ラベルの修正に従う
+	return modify_label($key, 'gas');
+}
+
+
+#------------------------------------------------------------------------------
+#	シンボルデータベースにラベルまたはシンボルが登録されているか確認
+#
+#	[parameters]
+#		・$key
+#			ラベルまたはシンボル
+#	
+#	[return]
+#		・0
+#			登録なし
+#
+#		・1
+#			登録あり
+#------------------------------------------------------------------------------
+sub symbol_db_exists {
+	my (
+		$key
+	) = @_;
+	for (my $depth = $g_symbol_db{'depth'}; $depth >= 0; $depth--) {
+		if (defined($g_symbol_db{'stack'}[$depth]{$key})) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
+#------------------------------------------------------------------------------
+#	シンボルデータベースのスタックを 1 段深くする
+#
+#	[parameters]
+#		なし
+#	
+#	[return]
+#		なし
+#------------------------------------------------------------------------------
+sub symbol_db_inc_depth {
+	$g_symbol_db{'depth'}++;
+	push(@{$g_symbol_db{'stack'}}, {});
+	if (DEBUG) {
+		print "symbol_db_inc_depth\n";
+	}
+}
+
+
+#------------------------------------------------------------------------------
+#	シンボルデータベースのスタックを 1 段浅くする
+#
+#	[parameters]
+#		なし
+#	
+#	[return]
+#		なし
+#------------------------------------------------------------------------------
+sub symbol_db_dec_depth {
+	if ($g_symbol_db{'depth'} == 0) {
+		die("$g_src_location: ERROR: symbol_db_dec_depth failed.");
+	}
+	pop(@{$g_symbol_db{'stack'}});
+	$g_symbol_db{'depth'}--;
+	if (DEBUG) {
+		print "symbol_db_dec_depth\n";
+	}
 }
 
 
