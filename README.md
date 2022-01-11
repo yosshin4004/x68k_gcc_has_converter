@@ -138,7 +138,7 @@ __length_code:                                          *_length_code:
 
 # 現状の制限事項
 
-inline asm 内に記述する HAS 形式アセンブラコードには、
+inline asm 内に記述可能な HAS 形式アセンブラコードには、
 現状多くの制限があります。
 
 * マクロ制御命令に対応していない  
@@ -160,6 +160,12 @@ GCC が出力するアセンブラソースの全てのパターンが想定し�
 本コンバーター側の問題である可能性が高いです。
 もしそのような状況に遭遇した場合は、
 エラーを起こした該当行の情報等を添えてご報告いただけるとありがたいです。
+
+
+
+# ライセンス
+
+Apache License Version 2.0 が適用されます。
 
 
 
@@ -344,8 +350,4 @@ make install-target-libgcc 2<&1 | tee build.log
 cd ${ROOT_DIR}
 ```
 
-
-# ライセンス
-
-Apache License Version 2.0 が適用されます。
 
