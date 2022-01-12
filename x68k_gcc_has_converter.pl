@@ -54,6 +54,10 @@ my @g_asm_modes = ('gas', 'has');
 my %g_symbol_db;
 
 
+# 何にもマッチしない正規表現
+my $g_regex_fail = '(*FAIL)';
+
+
 # シンボル名に利用可能な文字
 #	HAS の詳細仕様が不明なので推測に基づく。
 my $g_regex_symbol_char_wo_num = '[a-zA-Z_?~.]';
@@ -281,10 +285,7 @@ my $g_regex_opsize = '(?:[:.][bwlsdxp]' . $g_regex_end_of_name . ')';
 my $g_regex_register_scale = '(?:[:*][1248]' . $g_regex_end_of_name . ')';
 
 # ディレクティブにマッチする正規表現
-#	GAS のディレクティブは全貌が不明だが、. から始まるならディレクティブと
-#	見なせるので単純な正規表現で認識可能。
-#
-#	一方 HAS のディレクティブは . を省略可能なため、インストラクションとの
+#	HAS のディレクティブは、冒頭の . が省略可能なため、インストラクションとの
 #	区別が難しい。やむを得ず全ディレクティブをパターンマッチするしかない。
 #	ここでは「ぷにぐらま～ずまにゅある 第七版 第二刷」の HAS の解説に
 #	書かれている情報を元に正規表現を定義している。
@@ -401,6 +402,7 @@ $g_regex_symbol_definition_directive{'has'} =
 .		')'
 .		$g_regex_end_of_name
 .	')';
+$g_regex_symbol_definition_directive{'gas'} = $g_regex_fail;
 
 # 条件付きアセンブリディレクティブにマッチする正規表現
 #	m68k-elf-gcc から出力されるアセンブリコードには含まれないので、
@@ -423,6 +425,7 @@ $g_regex_conditional_assembly_directive{'has'} =
 .		')'
 .		$g_regex_end_of_name
 .	')';
+$g_regex_conditional_assembly_directive{'gas'} = $g_regex_fail;
 
 
 # インストラクションにマッチする正規表現
@@ -1168,8 +1171,8 @@ sub modify_directive {
 		#		.string	"ABC"
 		#	HAS
 		#		.dc.b $41,$42,$43,$00	（末端に \0 が付加される）
-		# 注：0 バイト長文字列を認識する必要があるので、正規表現は .* を使用。
-		elsif ($line =~ /^(\s*)\.string\s+\"(.*)\"$g_regex_end/i) {
+		# 注：0 バイト長文字列を認識する必要がある。エスケープシーケンスを考慮する。
+		elsif ($line =~ /^(\s*)\.string\s+\"((?:\\.|[^\\])*)\"$g_regex_end/i) {
 			my $spaces	= $1;
 			my $string	= $2;
 			$modified = convert_string_to_dump($string);
@@ -1179,8 +1182,8 @@ sub modify_directive {
 		#		.ascii "\b\007\009"
 		#	HAS
 		#		.dc.b $08,$07,$09	（末端に \0 が付加されない）
-		# 注：0 バイト長文字列を認識する必要があるので、正規表現は .* を使用。
-		elsif ($line =~ /^(\s*)\.ascii\s+\"(.*)\"$g_regex_end/i) {
+		# 注：0 バイト長文字列を認識する必要がある。エスケープシーケンスを考慮する。
+		elsif ($line =~ /^(\s*)\.ascii\s+\"((?:\\.|[^\\])*)\"$g_regex_end/i) {
 			my $spaces	= $1;
 			my $string	= $2;
 			$modified = convert_ascii_to_dump($string);
@@ -2605,11 +2608,14 @@ sub decode_escape_sequence {
 			elsif ($chars[$i + 1] eq 'v') { push(@decoded, '$0b'); $i += 1; }
 			elsif ($chars[$i + 1] eq 'f') { push(@decoded, '$0c'); $i += 1; }
 			elsif ($chars[$i + 1] eq 'r') { push(@decoded, '$0d'); $i += 1; }
-			elsif ($chars[$i + 1] eq '\\'){ push(@decoded, '$5c'); $i += 1; }
 			# 3 桁 8 進数エンコード
-			elsif ('0' <= $chars[$i + 1] && $chars[$i + 1] <= '9') {
+			elsif (ord('0') <= ord($chars[$i + 1]) && ord($chars[$i + 1]) <= ord('9')) {
 				push(@decoded, '$' . sprintf("%02x", oct($chars[$i + 1] . $chars[$i + 2] . $chars[$i + 3])));
 				$i += 3;
+			}
+			# その他の場合は変更せず出力
+			else {
+				push(@decoded, '$' . sprintf("%02x", ord($chars[$i + 1]))); $i += 1;
 			}
 		} else {
 			push(@decoded, '$' . sprintf("%02x", ord($chars[$i])));
