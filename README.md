@@ -31,7 +31,9 @@ POSIX 環境上（Linux 等）で、以下のコマンドを実行します。
 m68k-elf-gcc example.c -IXC2102/INCLUDE -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gas.s
 
 # HAS.X が処理可能なフォーマットに変換する。
-perl x68k_gcc_has_converter.pl -i example.m68k_gas.s -o example.s
+# -cpu オプションで、対象とする CPU の種類が指定できる。
+# -inc オプションで、ソース冒頭で include するファイルが指定できる。
+perl x68k_gcc_has_converter.pl -i example.m68k_gas.s -o example.s -cpu 68000 -inc doscall.equ
 ```
 カレントディレクトリに、HAS.X 形式の example.s が得られます。
 
@@ -138,15 +140,18 @@ __length_code:                                          *_length_code:
 
 # 現状の制限事項
 
-inline asm 内に記述可能な HAS 形式アセンブラコードには、
 現状多くの制限があります。
 
-* マクロ制御命令に対応していない  
-macro local endm exitm rept irp irpc
+* GAS 形式アセンブラコードは gcc が出力する形式のみに対応  
+GAS 形式アセンブラコードの記述方法のうち、gcc が出力する可能性のあるもののみが認識可能です。
 
-* 条件付きアセンブリに未対応  
-if ifeq iff ifne ifdef ifndef else elseif endif endc
+* inline asm 内は HAS 形式アセンブラコードのみに対応  
+inline asm 内は HAS 形式アセンブラコードで書かれてることが前提となっています。
+例外的に inline asm 引数として、GAS 形式のレジスタやアドレッシングが記述可能です。
 
+* inline asm 内に記述可能な HAS 形式アセンブラコードの制限  
+HAS のマクロ制御命令 macro local endm exitm rept irp irpc は利用できません。
+特殊記号 '&' '!' , '<'～'>' , '%' は未実装です。
 
 
 # 絶賛テスト中
@@ -156,6 +161,9 @@ if ifeq iff ifne ifdef ifndef else elseif endif endc
 
 まだまだ完璧と言える段階にはほど遠いのが現状です。
 GCC が出力するアセンブラソースの全てのパターンが想定しきれていません。
+HAS の inline asm 周りの対応も不完全です。
+修正に伴い、予告なく互換ブレイクするような変更が入ることも予想されます。
+
 ソースコード変換中にエラーが発生したり、HAS.X でアセンブル中にエラーが発生した場合は、
 本コンバーター側の問題である可能性が高いです。
 もしそのような状況に遭遇した場合は、
@@ -176,7 +184,13 @@ m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した 
 
 
 >:warning:
->Linux のディストリビューターが提供してる m68k-linux-gnu-gcc などのビルド済み gcc は、X68K と ABI が異なる（関数の戻り値が d0 または a0 に格納されていることを期待する）場合があり、生成されたコードを既存の X68K 資産とリンクすることは不可能です。この問題を回避するには、ここで解説しているように gcc 自体をソースコードからビルドする必要があります。
+>Linux のディストリビューターが提供している m68k-linux-gnu-gcc などのビルド済み gcc は、X68K と ABI が異なる（関数の戻り値が d0 または a0 に格納されていることを期待する）場合があり、生成されたコードを既存の X68K 資産とリンクすることは不可能です。この問題を回避するには、ここで解説しているように gcc 自体をソースコードからビルドする必要があります。
+
+
+>:warning:
+>以下の手順で生成される libgcc.a は、m68k-elf-gcc でしか利用できない形式です。
+>回避策として、旧 X68K gcc 向けの libgcc.a が利用可能ですが、一部の算術関数が足りないためリンクエラーを起こす場合があります。
+>X68K 上でリンク可能な最新の libgcc.a を作成する方法は、現状では未解決問題となっています。
 
 
 ```bash
