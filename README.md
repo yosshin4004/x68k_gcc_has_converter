@@ -261,8 +261,8 @@ ${SRC_DIR}/${BINUTILS_DIR}/configure \
     --enable-interwork \
     --enable-multilib \
 
-make -j${NUM_PROC} 2<&1 | tee build.log
-make install -j${NUM_PROC} 2<&1 | tee build.log
+make -j${NUM_PROC} 2<&1 | tee build.binutils.1.log
+make install -j${NUM_PROC} 2<&1 | tee build.binutils.2.log
 
 export PATH=${INSTALL_DIR}/bin:${PATH}
 
@@ -271,6 +271,9 @@ cd ${ROOT_DIR}
 
 #-----------------------------------------------------------------------------
 # gcc stage1
+#
+#	ColdFire 用の libgcc のバリエーションが大量に生成されることを抑制するため
+#	--with-arch=m68k を指定している。
 #-----------------------------------------------------------------------------
 
 mkdir -p ${BUILD_DIR}/${GCC_DIR}_stage1
@@ -292,6 +295,7 @@ ${SRC_DIR}/${GCC_DIR}/configure \
     --enable-lto \
     --enable-languages=c \
     --without-headers \
+    --with-arch=m68k \
     --with-cpu=${WITH_CPU} \
     --with-newlib \
     --enable-interwork \
@@ -299,10 +303,10 @@ ${SRC_DIR}/${GCC_DIR}/configure \
     --disable-shared \
     --disable-threads \
 
-make -j${NUM_PROC} 2<&1 | tee build.log
-make install 2<&1 | tee build.log
-make -j${NUM_PROC} all-target-libgcc 2<&1 | tee build.log
-make install-target-libgcc 2<&1 | tee build.log
+make -j${NUM_PROC} 2<&1 | tee build.gcc-stage1.1.log
+make install 2<&1 | tee build.gcc-stage1.2.log
+make -j${NUM_PROC} all-target-libgcc 2<&1 | tee build.gcc-stage1.3.log
+make install-target-libgcc 2<&1 | tee build.gcc-stage1.4.log
 
 cd ${ROOT_DIR}
 
@@ -330,14 +334,17 @@ ${SRC_DIR}/${NEWLIB_DIR}/configure \
     --prefix=${INSTALL_DIR} \
     --target=${TARGET} \
 
-make -j${NUM_PROC} 2<&1 | tee build.log
-make install | tee build.log
+make -j${NUM_PROC} 2<&1 | tee build.newlib.1.log
+make install | tee build.newlib.2.log
 
 cd ${ROOT_DIR}
 
 
 #-----------------------------------------------------------------------------
 # gcc stage2
+#
+#	ColdFire 用の libgcc のバリエーションが大量に生成されることを抑制するため
+#	--with-arch=m68k を指定している。
 #-----------------------------------------------------------------------------
 
 mkdir -p ${BUILD_DIR}/${GCC_DIR}_stage2
@@ -349,6 +356,7 @@ ${SRC_DIR}/${GCC_DIR}/configure \
     --target=${TARGET} \
     --enable-lto \
     --enable-languages=c,c++ \
+    --with-arch=m68k \
     --with-cpu=${WITH_CPU} \
     --with-newlib \
     --enable-interwork \
@@ -356,10 +364,10 @@ ${SRC_DIR}/${GCC_DIR}/configure \
     --disable-shared \
     --disable-threads \
 
-make -j${NUM_PROC} 2<&1 | tee build.log
-make install 2<&1 | tee build.log
-make -j${NUM_PROC} all-target-libgcc 2<&1 | tee build.log
-make install-target-libgcc 2<&1 | tee build.log
+make -j${NUM_PROC} 2<&1 | tee build.gcc-stage2.1.log
+make install 2<&1 | tee build.gcc-stage2.2.log
+make -j${NUM_PROC} all-target-libgcc 2<&1 | tee build.gcc-stage2.3.log
+make install-target-libgcc 2<&1 | tee build.gcc-stage2.4.log
 
 cd ${ROOT_DIR}
 ```
