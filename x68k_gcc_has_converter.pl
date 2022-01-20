@@ -53,6 +53,8 @@ my @g_asm_modes = ('gas', 'has');
 # シンボルデータベース
 my %g_symbol_db;
 
+# ラベル多重定義検出テーブル
+my %g_already_declared_label;
 
 # 何にもマッチしない正規表現
 my $g_regex_fail = '(*FAIL)';
@@ -131,19 +133,27 @@ my $g_regex_number =
 my $g_regex_label_and_symbol = '(?:' . $g_regex_symbol_char_wo_num . $g_regex_symbol_char_with_num . '*' . $g_regex_end_of_name . ')';
 
 # HAS 拡張機能のローカルラベル名の参照にマッチする正規表現
-#	@f @@f @@@f ...
-#	@b @@b @@@b ...
-#	1f ～ 9f
-#	1b ～ 9b
-#	10f ～ 99f	（HAS060 拡張）
-#	10b ～ 99b	（HAS060 拡張）
-my $g_regex_ref_has_local_label = '(?:(?:@+[fb]|[1-9][fb]|[1-9][0-9][fb])' . $g_regex_end_of_name . ')';
+#	HAS
+#		@f @@f @@@f ...
+#		@b @@b @@@b ...
+#		1f ～ 9999f	（2 桁以上は HAS060 拡張）
+#		1b ～ 9999b	（2 桁以上は HAS060 拡張）
+#	GAS
+#		1f ～ 9999f
+#		1b ～ 9999b
+my %g_regex_ref_local_label;
+$g_regex_ref_local_label{'has'} = '(?:(?:@+[fb]|[1-9][0-9]*[fb])' . $g_regex_end_of_name . ')';
+$g_regex_ref_local_label{'gas'} = '(?:(?:[1-9][0-9]*[fb])' . $g_regex_end_of_name . ')';
 
-# HAS 拡張機能のローカルラベルにマッチする正規表現
-#	@@:
-#	1: ～ 9:
-#	10: ～ 99:	（HAS060 拡張）
-my $g_regex_has_local_label = '(?:(?:@@|[1-9]|[1-9][0-9])' . $g_regex_end_of_name . ')';
+# ローカルラベルにマッチする正規表現
+#	HAS
+#		@@:
+#		1: ～ 9999:	（2 桁以上は HAS060 拡張）
+#	GAS
+#		1: ～ 9999:
+my %g_regex_local_label;
+$g_regex_local_label{'has'} = '(?:(?:@@|[1-9][0-9]*)' . $g_regex_end_of_name . ')';
+$g_regex_local_label{'gas'} = '(?:(?:[1-9][0-9]*)' . $g_regex_end_of_name . ')';
 
 
 # 丸括弧にマッチする正規表現
@@ -236,7 +246,7 @@ $g_regex_expression{'has'} =
 	'(?:'
 .		'(?:'
 .			$g_regex_label_and_symbol
-.		'|'.$g_regex_ref_has_local_label
+.		'|'.$g_regex_ref_local_label{'has'}
 .		'|'.$g_regex_number
 .		'|'.$g_regex_operator{'has'}
 .		'|'.$g_regex_parenthesis
@@ -246,6 +256,7 @@ $g_regex_expression{'gas'} =
 	'(?:'
 .		'(?:'
 .			$g_regex_label_and_symbol
+.		'|'.$g_regex_ref_local_label{'gas'}
 .		'|'.$g_regex_number
 .		'|'.$g_regex_operator{'gas'}
 .		'|'.$g_regex_parenthesis
@@ -385,7 +396,7 @@ $g_regex_directive{'has'} =
 #	定義することは難しい。
 #	幸い、GAS のディレクティブは . で始まるというルールがあるので、それに従い
 #	正規表現を定義すれば問題ない。
-$g_regex_directive{'gas'} = '(?:\\.[a-zA-Z][0-9a-zA-Z]*' . $g_regex_opsize . '?' . $g_regex_end_of_name .')';
+$g_regex_directive{'gas'} = '(?:\\.[a-zA-Z][0-9a-zA-Z_]*' . $g_regex_opsize . '?' . $g_regex_end_of_name .')';
 
 # ラベル定義ディレクティブにマッチする正規表現
 #	HAS の場合は冒頭 . が省略可能。
@@ -652,7 +663,8 @@ foreach my $asm_mode (@g_asm_modes) {
 	my $input_file_name;
 	my $output_file_name;
 	my $cpu_type = '68000';
-	my $force_include_file;
+	my $force_include_file_name_list;
+	my $inline_asm_syntax = 'has';
 
 	# 引数カウント
 	my $argc = @ARGV;
@@ -674,7 +686,8 @@ foreach my $asm_mode (@g_asm_modes) {
 		."\n".	'		-i <input filename>'
 		."\n".	'		-o <output filename>'
 		."\n".	'		-cpu <CPU type (default is 68000)>'
-		."\n".	'		-inc <force include filename>'
+		."\n".	'		-inc <comma-sepalated force include filename list>'
+		."\n".	'		-inline_asm_syntax <specify gas or has as a syntax for inline asm (default is has)>'
 		."\n".	''
 		."\n";
 		exit(EXIT_SUCCESS);
@@ -723,7 +736,17 @@ foreach my $asm_mode (@g_asm_modes) {
 					print "ERROR : Argument for " . $ARGV[$iArg - 1] . " is not specified.\n";
 					exit(EXIT_FAILURE);
 				}
-				$force_include_file = $ARGV[$iArg];
+				$force_include_file_name_list = $ARGV[$iArg];
+			}
+			# inline アセンブラ内の構文
+			elsif ($ARGV[$iArg] eq "-inline_asm_syntax") {
+				# 引数取得
+				$iArg++;
+				if ($iArg >= $argc) {
+					print "ERROR : Argument for " . $ARGV[$iArg - 1] . " is not specified.\n";
+					exit(EXIT_FAILURE);
+				}
+				$inline_asm_syntax = $ARGV[$iArg];
 			}
 			# いずれも該当しないなら不正な引数
 			else {
@@ -751,7 +774,7 @@ foreach my $asm_mode (@g_asm_modes) {
 	}
 
 	# コンバータ適用
-	apply_converter($input_file_name, $output_file_name, $cpu_type, $force_include_file);
+	apply_converter($input_file_name, $output_file_name, $cpu_type, $force_include_file_name_list, $inline_asm_syntax);
 }
 
 exit(EXIT_SUCCESS);
@@ -771,8 +794,11 @@ exit(EXIT_SUCCESS);
 #		・$cpu_type
 #			CPU タイプ
 #
-#		・$force_include_file
-#			強制 include ファイル名
+#		・$force_include_file_name_list
+#			強制 include ファイル名リスト（カンマ区切り）
+#
+#		・$inline_asm_syntax
+#			inline asm 内の構文
 #
 #	[return]
 #		なし
@@ -782,7 +808,8 @@ sub apply_converter {
 		$input_file_name,
 		$output_file_name,
 		$cpu_type,
-		$force_include_file,
+		$force_include_file_name_list,
+		$inline_asm_syntax,
 	) = @_;
 
 	# 処理内容を TTY 出力（デバッグ用途）
@@ -798,6 +825,9 @@ sub apply_converter {
 	#	1 パス目：ラベル置換ルール作成
 	#	2 パス目：ラベル置換ルールに従ったコンバートの実行
 	for (my $pass = 1; $pass <= 2; $pass++) {
+		# ラベル多重定義検出テーブルのクリア
+		%g_already_declared_label = ();
+
 		# 入力ファイルオープン
 		my $fh_input  = IO::File->new($input_file_name,  'r') or die("ERROR : Cannot open [" . $input_file_name  . "].\n");
 
@@ -808,8 +838,10 @@ sub apply_converter {
 			."\n".	'RUNS_HUMAN_VERSION	equ	3'
 			."\n".	'	.cpu ' . $cpu_type
 			."\n";
-			if ($force_include_file ne '') {
-				print $fh_output '	.include ' . $force_include_file . "\n";
+			if ($force_include_file_name_list ne '') {
+				foreach my $file_name (split(',', $force_include_file_name_list)) {
+					print $fh_output '	.include ' . $file_name . "\n";
+				}
 			}
 			print $fh_output
 					'* X68 GCC Develop'
@@ -849,13 +881,13 @@ sub apply_converter {
 					#	ここより先は inline asm の外であると解釈する。
 					if    ($line =~ /^\s*\#NO_APP$/i) {
 						$asm_mode = 'gas';
-						$modified = '* APP OFF (NO_APP)';
+						$modified = '* APP OFF (NO_APP) asm_mode=' . $asm_mode;
 					}
 					# APP 行？
 					#	ここより先は inline asm の中であると解釈する。
 					elsif ($line =~ /^\s*\#APP$/i) {
-						$asm_mode = 'has';
-						$modified = '* APP ON (APP)';
+						$asm_mode = $inline_asm_syntax;
+						$modified = '* APP ON (APP) asm_mode=' . $asm_mode;
 					}
 					next;
 				}
@@ -865,15 +897,15 @@ sub apply_converter {
 				if (
 					# : で終わるラベル宣言は、行頭にスペースを許可しなければならない。
 					$line =~ /^\s*$g_regex_label_and_symbol\s*\:/i
+					# : で終わるラベル宣言は、行頭にスペースを許可しなければならない。
+				||	$line =~ /^\s*$g_regex_local_label{$asm_mode}\s*\:/i
 					# ディレクティブによるラベル定義
 				||	$line =~ /^\s*$g_regex_label_definition_directive{$asm_mode}/i
 				||	(
 						$asm_mode eq 'has'
 					&&	(
-							# : で終わるラベル宣言は、行頭にスペースを許可しなければならない。
-							$line =~ /^\s*$g_regex_has_local_label\s*\:/i
 							# 末尾 : を省略する表記の場合、行頭スペースは許可しない。
-						||	$line =~ /^$g_regex_label_and_symbol\s*\=/i
+							$line =~ /^$g_regex_label_and_symbol\s*\=/i
 						||	$line =~ /^\s*$g_regex_label_and_symbol\s+$g_regex_symbol_definition_directive{$asm_mode}/i
 						)
 					)
@@ -1260,12 +1292,32 @@ sub modify_directive {
 		#	GAS
 		#			.comm	<label>,<size>,<align>
 		#	HAS
-		#			.comm	<label>,<size>,<align>
+		#			.comm	<label>,<size>
 		elsif ($line =~ /(\s*)\.comm(\s+)(.+?)$g_regex_end/i) {
 			my $spaces1		= $1;
 			my $spaces2		= $2;
 			my $arg_list	= $3;
-			$modified = $spaces1 . '.comm' . $spaces2 . modify_arg_list($arg_list, $asm_mode);
+
+			my @args = split_and_strip_arg_list($arg_list);
+			my $num_args = @args;
+			# 3 引数？
+			if    ($num_args == 3) {
+				# 引数 <align> は .align 命令に分離する。
+				# <align> == 1 の時もエラーにので回避が必要。
+				$arg_list = $args[0] . ',' . $args[1];
+				if ($args[2] != 1) {
+					$modified = $spaces1 . '.align ' . $args[2] . "	* workaround for 3 args .comm directive.\n";
+				}
+				$modified .= $spaces1 . '.comm' . $spaces2 . modify_arg_list($arg_list, $asm_mode);
+			}
+			# 2 引数？
+			elsif ($num_args == 2) {
+				$modified = $spaces1 . '.comm' . $spaces2 . modify_arg_list($arg_list, $asm_mode);
+			}
+			# 上記いずれにも該当しないならエラー
+			else {
+				die("$g_src_location: ERROR: modify_directive failed to parse [$line] as $asm_mode.\n");
+			}
 		}
 		# .zero ディレクティブ
 		#	GAS
@@ -1356,17 +1408,18 @@ sub modify_directive {
 			$modified = $spaces1 . $directive;
 		}
 		# HAS が認識できないディレクティブの除去
+		#	.hidden		複数ファイルにまたがって参照されるが非公開にしたいラベル
 		#	.type		ラベルの用途を指定するデバッグ情報らしい
 		#	.size		デバッグ情報らしい
 		#	.ident		コンパイラのバージョン情報らしい
 		#	.section	必要なものは個別に認識済み
 		#	.swbeg		詳細不明
 		#	.cfi_...	デバッグ情報らしい
-		elsif ($line =~ /^(\s*)(\.(?:type|size|ident|swbeg|cfi_\w+))(\s+)(.+?)$g_regex_end/i) {
+		elsif ($line =~ /^(\s*)(\.(?:hidden|type|size|ident|section|swbeg|cfi_\w+))(?:(\s+)(.+?))?$g_regex_end/i) {
 			my $spaces1		= $1;
 			my $directive	= $2;
-			my $spaces2		= $3;
-			my $arg_list	= $4;
+			my $spaces2		= $3;	# 省略可能
+			my $arg_list	= $4;	# 省略可能
 			# 何も行わない
 		}
 		# 上記いずれにも該当しないならエラー
@@ -1499,13 +1552,9 @@ sub modify_label_and_symbol_definition {
 			symbol_db_register_symbol($symbol);
 		}
 	}
-	# HAS 拡張のローカルラベル宣言行？
-	#	@@:
-	#	1: ～ 9:
-	#	10: ～ 99:	（HAS060 拡張）
+	# ローカルラベル宣言行？
 	elsif (
-		$asm_mode eq 'has'
-	&&	$line =~ /^(\s*)($g_regex_has_local_label)(\s*)\:/i
+		$line =~ /^(\s*)($g_regex_local_label{$asm_mode})(\s*)\:/i
 	) {
 		my $spaces1		= $1;
 		my $local_label	= $2;
@@ -1534,22 +1583,42 @@ sub modify_label_and_symbol_definition {
 		my $spaces2		= $3;
 		my $label		= $4;
 		my $modified_label = modify_label($label, $asm_mode);
-		if ($asm_mode eq 'gas'
-		&&	$directive ne '.local'
-		) {
-			$modified = $spaces1 . $directive . $spaces2 . $modified_label;
-		}
-		if ($pass == 1) {
-			symbol_db_register_label($label, $modified_label);
-		}
 
-		# X68K gcc は main() があるとき .xdef _main と .xref __main を出力する。
-		# .xref __main を出力しないと、libc のリンクに失敗する。
-		# 参考 https://twitter.com/kamadox/status/1477648323184312324
-		if ($label eq 'main') {
-			$modified =
-				"	.xref __main	* workaround for libc.\n"
-			.	$modified;
+		# 既出？
+		if (exists($g_already_declared_label{$label})) {
+			# 矛盾があるならエラー
+			if ($g_already_declared_label{$label} ne $directive) {
+				die("$g_src_location: ERROR: modify_label_and_symbol_definition failed. [$label] is already declared as $directive.\n");
+			}
+
+			# 矛盾がない場合はエラーとはしない。
+			# そして HAS 上で多重定義と見なされるので削除する。
+			print "$g_src_location: WARNING: delete duplicated $line\n";
+
+		} else {
+			# 既出にする
+			$g_already_declared_label{$label} = $directive;
+
+			# GAS の .local は HAS 形式でも必要。
+			# これを省略すると、comm ディレクティブで宣言されるシンボルが、
+			# 置換ルールに登録されない。
+			if ($asm_mode eq 'gas'
+			&&	$directive ne '.local'
+			) {
+				$modified = $spaces1 . $directive . $spaces2 . $modified_label;
+			}
+			if ($pass == 1) {
+				symbol_db_register_label($label, $modified_label);
+			}
+
+			# X68K gcc は main() があるとき .xdef _main と .xref __main を出力する。
+			# .xref __main を出力しないと、libc のリンクに失敗する。
+			# 参考 https://twitter.com/kamadox/status/1477648323184312324
+			if ($label eq 'main') {
+				$modified =
+					"	.xref __main	* workaround for libc.\n"
+				.	$modified;
+			}
 		}
 	}
 	# 上記いずれにも該当しないならエラー
@@ -1693,14 +1762,21 @@ sub modify_instruction {
 		}
 		# fjXX 命令
 		#	GAS
-		#		fjhi	fjls	fjcc	fjcs	fjne	fjeq	fjvc
-		#		fjvs	fjpl	fjmi	fjge	fjlt	fjgt	fjle
+		#		fjne   fjeq   fjge   fjlt   fjgt   fjle   fjf
+		#		fjt    fjgl   fjgle  fjnge  fjngl  fjngle fjngt
+		#		fjnle  fjnlt  fjoge  fjogl  fjogt  fjole  fjolt
+		#		fjor   fjseq  fjsf   fjsne  fjst   fjueq  fjuge
+		#		fjugt  fjule  fjult  fjun
 		#	HAS
-		#		fbhi	fbls	fbcc	fbcs	fbne	fbeq	fbvc
-		#		fbvs	fbpl	fbmi	fbge	fblt	fbgt	fble
+		#		fbne   fbeq   fbge   fblt   fbgt   fble   fbf
+		#		fbt    fbgl   fbgle  fbnge  fbngl  fbngle fbngt
+		#		fbnle  fbnlt  fboge  fbogl  fbogt  fbole  fbolt
+		#		fbor   fbseq  fbsf   fbsne  fbst   fbueq  fbuge
+		#		fbugt  fbule  fbult  fbun
 		#
 		# fjbcc のような仕組みは無いようだ。
-		elsif ($line =~ /^(\s*)fj(hi|ls|cc|cs|ne|eq|vc|vs|pl|mi|ge|lt|gt|le)(\s+)(.+?)$g_regex_end/i) {
+		# 誤認識を避けるため、文字数の長い方からマッチする必要がある。
+		elsif ($line =~ /^(\s*)fj(ngle|gle|nge|ngl|ngt|nlt|oge|ogl|ogt|ole|olt|seq|sne|ueq|uge|nle|ugt|ule|ult|ne|eq|ge|lt|gt|le|gl|or|sf|st|un|f|t|)(\s+)(.+?)$g_regex_end/i) {
 			my $spaces1		= $1;
 			my $condition	= $2;
 			my $spaces2		= $3;
@@ -2527,12 +2603,11 @@ sub split_and_modify_arg_list {
 			$arg .= $operator;
 			$state = 'operator';
 		}
-		# HAS のローカルラベル？
-		#	ローカルラベルに含まれる @ が項の境界と見なされてしまうので、
+		# ローカルラベル？
+		#	HAS の場合ローカルラベルに含まれる @ が項の境界と見なされてしまうので、
 		#	ここでローカルラベル全体を認識して取り除く。
 		elsif (
-			$asm_mode eq 'has'
-		&&	$arg_list =~ /^($g_regex_ref_has_local_label)/i
+			$arg_list =~ /^($g_regex_ref_local_label{$asm_mode})/i
 		) {
 			$arg_list = $';
 			my $local_label = $1;
@@ -2850,7 +2925,7 @@ sub symbol_db_translate {
 
 	# 置換ルールに登録されているか？
 	for (my $depth = $g_symbol_db{'depth'}; $depth >= 0; $depth--) {
-		if (defined($g_symbol_db{'stack'}[$depth]{$key})) {
+		if (exists($g_symbol_db{'stack'}[$depth]{$key})) {
 			return $g_symbol_db{'stack'}[$depth]{$key};
 		}
 	}
@@ -2879,7 +2954,7 @@ sub symbol_db_exists {
 		$key
 	) = @_;
 	for (my $depth = $g_symbol_db{'depth'}; $depth >= 0; $depth--) {
-		if (defined($g_symbol_db{'stack'}[$depth]{$key})) {
+		if (exists($g_symbol_db{'stack'}[$depth]{$key})) {
 			return 1;
 		}
 	}
