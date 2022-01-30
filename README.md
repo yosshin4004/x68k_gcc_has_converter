@@ -5,50 +5,61 @@
 
 x68k_gcc_has_converter は、
 m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した gcc）が生成する gas 形式のアセンブラソースを、
-X68K のデファクトスタンダードなアセンブラである HAS.X (X68K High-speed Assembler by Y.Nakamura(YuNK)) が処理可能な形式に変換するツールです。
+X68K のデファクトスタンダードなアセンブラである
+HAS.X (X68K High-speed Assembler by Y.Nakamura(YuNK) 氏)
+およびその 68060 拡張版である HAS060.X (by M.Kamada 氏)
+が処理可能な形式に変換するツールです。
 
 本ツールを利用することで、gcc でクロスコンパイルしたコードを X68K のオブジェクトファイル形式に変換し、
-過去のソフトウェア資産（例えば SHARP XC コンパイラに含まれるライブラリ群など）とリンクすることが可能になります。
+従来の X68K 対応コンパイラ（SHARP XC および古い X68K 移植版 gcc）向けのソフトウェア資産とリンクし、
+X68K の実行ファイルを生成することが可能になります。
 
 X68K にはこれまでも複数の移植版 gcc が存在しましたが、最も新しいものでも ver 2.95.2 ベース（1997年）であり、それ以降の更新はありませんでした。
-本ツールを利用することで、最新の gcc が利用可能になります。これにより、以下のようなメリットが得られます。
+本ツールを利用することで、最新の gcc が利用可能になり、以下のようなメリットが得られます。
 * 新しい言語仕様に準拠したコードが記述可能になる。
 * より強化された最適化の恩恵が受けられる。
 
 
 # 利用例
 
-例として、example.c を X68K のオブジェクトファイルに変換する手順を示します。
+例として、example.c を X68K のオブジェクトファイルに変換し、実行ファイルを生成する手順を示します。
 
-POSIX 環境上（Linux 等）で、以下のコマンドを実行します。
+コンパイルは、POSIX 環境上（Linux / msys 等）で行います。
 （クロスコンパイラである m68k-elf-gcc の生成手順は後述します。）
-
 ```bash
 # example.c をコンパイルする。
 # X68K と ABI を一致させるため d2 a2 を破壊可能レジスタとして指定している。
 # X68K 専用の API を認識させるため、-I オプションでそれらを定義するヘッダのパスを指定している。
-# この例では XC2102/INCLUDE に sharp XC コンパイラのヘッダが存在すると仮定している。
-m68k-elf-gcc example.c -IXC2102/INCLUDE -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k_gas.s
+# この例では ./XC2102/INCLUDE に sharp XC コンパイラのヘッダが存在すると仮定している。
+m68k-elf-gcc example.c -I./XC2102/INCLUDE -S -Os -m68000 -fcall-used-d2 -fcall-used-a2 -o example.m68k-gas.s
 
 # HAS.X が処理可能なフォーマットに変換する。
 # -cpu オプションで、対象とする CPU の種類が指定できる。
 # -inc オプションで、ソース冒頭で include するファイルが指定できる。
-perl x68k_gcc_has_converter.pl -i example.m68k_gas.s -o example.s -cpu 68000 -inc doscall.equ
+perl x68k_gcc_has_converter.pl -i example.m68k-gas.s -o example.s -cpu 68000 -inc doscall.equ,iocscall.mac
 ```
 カレントディレクトリに、HAS.X 形式の example.s が得られます。
 
-続いて、X68K 上で以下のコマンドを実行します。
+続いて、example.s をアセンブルします。以降の手順は、X68K 上で実行します。
 ```bat
 rem HAS.X を実行し、X68K のオブジェクトファイルに変換する。
 rem -u : 未定義シンボルを外部参照にする 
 rem -e : 外部参照オフセットをロングワードにする 
-rem -w 0 : 警告の抑制
-HAS.X -e -u -w 0 -o example.o example.s
+rem -w0 : 警告の抑制
+HAS.X -e -u -w0 -o example.o example.s
+```
+カレントディレクトリに example.o が得られます。
+
+これを実行ファイルに変換するには、m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式の libgcc.a をリンクする必要があります。
+（このような libgcc.a の生成手順は後述します。）
+```bat
+rem example.o は、既存の X68K のソフトウェア資産とリンク可能。
+rem CLIB.L FLOATFNC.L は sharp XC コンパイラに含まれるライブラリである。
+rem ここで選択した libgcc.a は、初代 MC68000 の命令セットで構成されている。
+HLK.X -o example.x example.o CLIB.L FLOATFNC.L m68k_elf/m68000/libgcc.a
 ```
 
-カレントディレクトリに example.o が得られます。
-このファイルは、既存の X68K のソフトウェア資産とリンク可能です。
-
+カレントディレクトリに example.x が得られます。
 
 
 # HAS.X 形式変換例
@@ -138,238 +149,164 @@ __length_code:                                          *_length_code:
 ```
 
 
-# 現状の制限事項
+# libgcc.a の種類と用途
+
+libgcc.a は、用途に応じて複数の種類から選択して利用可能です。
+
+* m68k_elf/m68000/libgcc.a  
+	MC68000 の命令セットで構成されています。
+	全世代の X680x0 で動作可能な実行ファイルを作成する場合にリンクします。
+	FPU 非搭載 X68030 環境も、こちらをリンクしてください。
+
+* m68k_elf/m68020/libgcc.a  
+	MC68020 の命令セット + FPU の MC68881 命令セットで構成されています。
+	FPU 搭載 X68030 で動作可能な実行ファイルを作成する場合にリンクします。
+	FPU 非搭載 X68030 では動作しないのでご注意ください。
+	また、MC68040 以降の内蔵 FPU には存在しない浮動小数演算命令（FMOVECR 等々）が生成されるので、
+	040Turbo/060Turbo 等の環境で動作しない場合がある点もご注意ください。
+
+* m68k_elf/m68040/libgcc.a  
+	MC68040 の命令セットで構成されています。
+	040Turbo 等のアクセラレータを搭載した X680x0 で動作可能な実行ファイルを作成する場合にリンクします。
+
+* m68k_elf/m68040/libgcc.a  
+	MC68060 の命令セットで構成されています。
+	060Turbo 等のアクセラレータを搭載した X680x0 で動作可能な実行ファイルを作成する場合にリンクします。
+
+
+# 互換性問題
+
+従来の X68K 対応コンパイラと、m68k-elf-gcc の間には、互換性問題があります。
+
+## 1. ABI が一致しない（回避策あり）  
+
+* 破壊レジスタ  
+	従来の X68K 対応コンパイラ : d0-d2/a0-a2/fp0-fp1  
+	m68k-elf-gcc : d0-d2/a0-a2/fp0-fp1  
+	この問題は、m68k-elf-gcc 側にコンパイルオプション -fcall-used-d2 -fcall-used-a2 を指定することで解消されます。
+
+* 戻り値を格納するレジスタ  
+	X68K の ABI は、MC680x0 の慣例に従い、関数の戻り値は d0 レジスタに格納するルールになっていました。
+	一方、最新の gcc では、configure によっては戻り値を a0 レジスタにも格納します。
+	これは、malloc() のようにポインタを返すことが明らかな関数の場合、
+	アドレスレジスタに戻り値を返せばオーバーヘッドを回避できる、という考え方が根底にあります。
+	しかし実際には、安全性と互換性のため a0 d0 双方に同一の値を返すという運用になっており、
+	逆にオーバーヘッド発生源になっています。
+	そして、結果を a0 レジスタから読むコードが生成されることにより、過去のソフトウェア資産が再利用できなくなっています。
+	
+	この問題を避けるには、
+	関数の戻り値を d0 レジスタのみに格納する configure でビルドされた gcc を利用する必要があります。
+	最も確実な方法は、後述する方法で m68k-elf-gcc を自力でビルドし利用することです。
+
+	>:warning:
+	>Linux のディストリビューターが提供している m68k-linux-gnu-gcc などのビルド済み gcc は、
+	>戻り値を a0 d0 双方に同一の値を返す動作になっており、X68K の ABI と互換性がありません。
+
+## 2. 一部の数値型のバイナリ表現が異なる（回避策は無いが影響を受ける可能性は低い）
+従来の X68K 対応コンパイラと m68k-elf-gcc との間で、一部の数値型のバイナリ表現が異なります。
+
+* long double 型（拡張倍精度浮動小数型）  
+	従来の X68K 対応コンパイラ : long double ＝ 8 bytes 型（double 型互換）  
+	m68k-elf-gcc : long double ＝ 12 bytes 型  
+
+* long long 型（64bit 整数型）  
+	従来の X68K 対応コンパイラ : 下位 32bit、上位 32bit の順に格納（つまりビッグエンディアン配置でない）  
+	m68k-elf-gcc : 上位 32bit、下位 32bit の順に格納（厳密にビッグエンディアン配置）  
+
+上記の型を扱うバイナリコードには互換性がなく、古いコードをリンクするには再ビルドが必要です。
+もし、ソースコードが入手できず再ビルド不能なコードの場合は、厄介な問題となります。
+古いバイナリ上の long double 型は、double 型として扱えば回避可能ですが、
+long long 型の場合は根本的に異なるため回避困難です。
+幸い、X68K 上のプログラミングでは long double 型や long long 型を利用することは少なく、
+過去のソフトウェア資産上に出現することは極めて稀であるため、
+問題となる状況はほとんど発生しないと考えられます。
+
+
+# 推奨される利用スタイル
+
+以上を踏まえて、
+gcc の互換性問題を回避しつつ、
+m68k-elf-gcc を活用したコードを記述する、現状の最善の方法をまとめます。
+
+1. ビルド構成が不明な gcc を利用せず、自力ビルドした gcc を利用する
+2. m68k-elf-gcc 側に -fcall-used-d2 -fcall-used-a2 を指定する
+3. m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式の libgcc.a を利用する
+4. 過去のバイナリ資産を再利用する場合は、long long 型、long double 型 を含まないものに限る
+
+
+# m68k-elf-gcc の作成手順
+
+m68k-elf-gcc を作成するには、
+200 GB 程度のディスク容量があることを確認した上で、
+build_m68k-toolchain.sh
+を実行します。
+（POSIX 環境必須。Linux か msys を推奨。他環境は未テスト。）
+
+全処理完了には、最大数時間程度の時間がかかります。
+正常終了すると、カレントディレクトリに m68k-toolchain/ というディレクトリが生成されるので、お好みのパスに移動して利用してください。
+
+ディレクトリ build_gcc/ は中間ファイルです。
+後述の libgcc.a 作成を自力で行う場合に再利用されますが、
+その必要がない場合は削除しても問題ありません。
+
+
+# libgcc.a の作成手順
+
+m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式の libgcc.a を作成するには、
+先述の build_m68k-toolchain.sh が実行完了し、
+bulid_gcc/ 以下に中間ファイルが存在する状態で、
+以下の手順を実行します。
+
+1. 旧 libgcc.a の入手  
+X68K 移植版 GCC 2.95.2 (by KQ 氏) の G295b04D.ZIP を入手し、
+アーカイブに含まれている旧 libgcc.a を取り出します。
+
+2. build_x68k-libgcc.sh の実行  
+build_x68k-libgcc.sh の置かれているディレクトリ上に 旧 libgcc.a をコピーし、
+build_x68k-libgcc.sh -old-libgcc ./libgcc.a
+を実行します。
+（一部の関数は旧 libgcc.a から流用し、それら以外は新しい libgcc のソースから再コンパイルして生成されます。）
+
+3. X68K 上でアセンブル＆リンク  
+ディレクトリ build_libgcc/ を X68K 上にコピーし、
+X68K 上で build_libgcc/src/m68k_elf を実行します。
+
+4. 必要なファイルのインストール  
+build_libgcc/lib/m68k_elf 以下に、ビルド結果が生成されます。お好みのパスに移動して利用してください。
+
+ディレクトリ build_libgcc/ は中間ファイルです。
+ここまでの手順が完了したら削除しても問題ありません。
+
+
+# その他の制限事項
 
 現状多くの制限があります。
 
 * GAS 形式アセンブラコードは gcc が出力する形式のみに対応  
-GAS 形式アセンブラコードの記述方法のうち、gcc が出力する可能性のあるもののみが認識可能です。
+	本コンバート・ツールが認識できるのは、GAS 形式アセンブラコードの記述方法のうち、gcc が出力する可能性のあるもののみです。
 
-* inline asm 内は HAS 形式アセンブラコードのみに対応  
-inline asm 内は HAS 形式アセンブラコードで書かれてることが前提となっています。
-例外的に inline asm 引数として、GAS 形式のレジスタやアドレッシングが記述可能です。
-
-* inline asm 内に記述可能な HAS 形式アセンブラコードの制限  
-HAS のマクロ制御命令 macro local endm exitm rept irp irpc は利用できません。
-特殊記号 '&' '!' , '<'～'>' , '%' は未実装です。
+* inline asm 内に記述可能なアセンブラコードの制限  
+	マクロ制御命令（HAS の macro local endm exitm rept irp irpc など）は利用できません。
+	特殊記号（HAS の '&' '!' , '<'～'>' , '%' など）が出現するとパースエラーになります。
 
 
 # 絶賛テスト中
 
-現在、コンバート精度を高めるため、
-様々なソースコードを入力して動作テストを行っています。
+現在、様々な条件での動作テストを行っています。
+修正が頻繁に行われています。
+当面の間、修正に伴い予告なく互換ブレイクが発生することも予想されますがご了承ください。
 
-まだまだ完璧と言える段階にはほど遠いのが現状です。
-GCC が出力するアセンブラソースの全てのパターンが想定しきれていません。
-HAS の inline asm 周りの対応も不完全です。
-修正に伴い、予告なく互換ブレイクするような変更が入ることも予想されます。
-
-ソースコード変換中にエラーが発生したり、HAS.X でアセンブル中にエラーが発生した場合は、
-本コンバーター側の問題である可能性が高いです。
-もしそのような状況に遭遇した場合は、
+環境構築時のエラーや、
+アセンブラソース変換中のエラーなど、
+何かしらの問題に遭遇した場合は、
 エラーを起こした該当行の情報等を添えてご報告いただけるとありがたいです。
-
 
 
 # ライセンス
 
-Apache License Version 2.0 が適用されます。
-
-
-
-# 補足：m68k-elf-gcc の作成方法
-
-m68k-elf-gcc（モトローラ 680x0 のクロスコンパイルに対応した gcc）は、以下の手順で作成可能です。
-（POSIX 環境必須。Linux 推奨。msys では完走できない。他環境は未テスト。）
-
-
->:warning:
->Linux のディストリビューターが提供している m68k-linux-gnu-gcc などのビルド済み gcc は、X68K と ABI が異なる（関数の戻り値が d0 または a0 に格納されていることを期待する）場合があり、生成されたコードを既存の X68K 資産とリンクすることは不可能です。この問題を回避するには、ここで解説しているように gcc 自体をソースコードからビルドする必要があります。
-
-
->:warning:
->以下の手順で生成される libgcc.a は、m68k-elf-gcc でしか利用できない形式です。
->回避策として、旧 X68K gcc 向けの libgcc.a が利用可能ですが、一部の算術関数が足りないためリンクエラーを起こす場合があります。
->X68K 上でリンク可能な最新の libgcc.a を作成する方法は、現状では未解決問題となっています。
-
-
-```bash
-#-----------------------------------------------------------------------------
-# settings
-#-----------------------------------------------------------------------------
-
-PREFIX="m68k-elf-"
-CPU="m68000"
-
-# binutils
-BINUTILS_VERSION="2.35"
-BINUTILS_ARCHIVE="binutils-${BINUTILS_VERSION}.tar.bz2"
-BINUTILS_URL="https://ftp.gnu.org/gnu/binutils/${BINUTILS_ARCHIVE}"
-BINUTILS_DIR="binutils-${BINUTILS_VERSION}"
-
-# gcc
-GCC_VERSION="10.2.0"
-GCC_ARCHIVE="gcc-${GCC_VERSION}.tar.gz"
-GCC_URL="https://gcc.gnu.org/pub/gcc/releases/gcc-${GCC_VERSION}/${GCC_ARCHIVE}"
-GCC_DIR="gcc-${GCC_VERSION}"
-
-# newlib
-NEWLIB_VERSION="3.3.0"
-NEWLIB_ARCHIVE="newlib-${NEWLIB_VERSION}.tar.gz"
-NEWLIB_URL="ftp://sourceware.org/pub/newlib/${NEWLIB_ARCHIVE}"
-NEWLIB_DIR="newlib-${NEWLIB_VERSION}"
-
-
-#-----------------------------------------------------------------------------
-# prepare
-#-----------------------------------------------------------------------------
-
-TARGET="m68k-elf"
-NUM_PROC=$(nproc)
-PROGRAM_PREFIX=${PREFIX}
-ROOT_DIR="${PWD}"
-INSTALL_DIR="${ROOT_DIR}/m68k-toolchain"
-DOWNLOAD_DIR="${ROOT_DIR}/download"
-BUILD_DIR="${ROOT_DIR}/build"
-SRC_DIR="${ROOT_DIR}/source"
-WITH_CPU=${CPU}
-
-mkdir -p ${INSTALL_DIR}
-mkdir -p ${BUILD_DIR}
-mkdir -p ${SRC_DIR}
-mkdir -p ${DOWNLOAD_DIR}
-
-
-#-----------------------------------------------------------------------------
-# binutils
-#-----------------------------------------------------------------------------
-
-mkdir -p ${BUILD_DIR}/${BINUTILS_DIR}
-
-cd ${DOWNLOAD_DIR}
-if ! [ -f "${BINUTILS_ARCHIVE}" ]; then
-    wget ${BINUTILS_URL}
-fi
-tar jxvf ${BINUTILS_ARCHIVE} -C ${SRC_DIR}
-
-cd ${BUILD_DIR}/${BINUTILS_DIR}
-${SRC_DIR}/${BINUTILS_DIR}/configure \
-    --prefix=${INSTALL_DIR} \
-    --program-prefix=${PROGRAM_PREFIX} \
-    --target=${TARGET} \
-    --enable-lto \
-    --enable-interwork \
-    --enable-multilib \
-
-make -j${NUM_PROC} 2<&1 | tee build.binutils.1.log
-make install -j${NUM_PROC} 2<&1 | tee build.binutils.2.log
-
-export PATH=${INSTALL_DIR}/bin:${PATH}
-
-cd ${ROOT_DIR}
-
-
-#-----------------------------------------------------------------------------
-# gcc stage1
-#
-#	ColdFire 用の libgcc のバリエーションが大量に生成されることを抑制するため
-#	--with-arch=m68k を指定している。
-#-----------------------------------------------------------------------------
-
-mkdir -p ${BUILD_DIR}/${GCC_DIR}_stage1
-
-cd ${DOWNLOAD_DIR}
-if ! [ -f "${GCC_ARCHIVE}" ]; then
-    wget ${GCC_URL}
-fi
-tar xvf ${GCC_ARCHIVE} -C ${SRC_DIR}
-
-cd ${SRC_DIR}/${GCC_DIR}
-./contrib/download_prerequisites
-
-cd ${BUILD_DIR}/${GCC_DIR}_stage1
-${SRC_DIR}/${GCC_DIR}/configure \
-    --prefix=${INSTALL_DIR} \
-    --program-prefix=${PROGRAM_PREFIX} \
-    --target=${TARGET} \
-    --enable-lto \
-    --enable-languages=c \
-    --without-headers \
-    --with-arch=m68k \
-    --with-cpu=${WITH_CPU} \
-    --with-newlib \
-    --enable-interwork \
-    --enable-multilib \
-    --disable-shared \
-    --disable-threads \
-
-make -j${NUM_PROC} 2<&1 | tee build.gcc-stage1.1.log
-make install 2<&1 | tee build.gcc-stage1.2.log
-make -j${NUM_PROC} all-target-libgcc 2<&1 | tee build.gcc-stage1.3.log
-make install-target-libgcc 2<&1 | tee build.gcc-stage1.4.log
-
-cd ${ROOT_DIR}
-
-
-#-----------------------------------------------------------------------------
-# newlib
-#-----------------------------------------------------------------------------
-
-mkdir ${BUILD_DIR}/${NEWLIB_DIR}
-
-if ! [ -f "${NEWLIB_ARCHIVE}" ]; then
-    wget ${NEWLIB_URL}
-fi
-tar zxvf ${NEWLIB_ARCHIVE} -C ${SRC_DIR}
-
-export CC_FOR_TARGET=${PROGRAM_PREFIX}gcc
-export LD_FOR_TARGET=${PROGRAM_PREFIX}ld
-export AS_FOR_TARGET=${PROGRAM_PREFIX}as
-export AR_FOR_TARGET=${PROGRAM_PREFIX}ar
-export RANLIB_FOR_TARGET=${PROGRAM_PREFIX}ranlib
-export newlib_cflags="${newlib_cflags} -DPREFER_SIZE_OVER_SPEED -D__OPTIMIZE_SIZE__"
-
-cd ${BUILD_DIR}/${NEWLIB_DIR}
-${SRC_DIR}/${NEWLIB_DIR}/configure \
-    --prefix=${INSTALL_DIR} \
-    --target=${TARGET} \
-
-make -j${NUM_PROC} 2<&1 | tee build.newlib.1.log
-make install | tee build.newlib.2.log
-
-cd ${ROOT_DIR}
-
-
-#-----------------------------------------------------------------------------
-# gcc stage2
-#
-#	ColdFire 用の libgcc のバリエーションが大量に生成されることを抑制するため
-#	--with-arch=m68k を指定している。
-#-----------------------------------------------------------------------------
-
-mkdir -p ${BUILD_DIR}/${GCC_DIR}_stage2
-
-cd ${BUILD_DIR}/${GCC_DIR}_stage2
-${SRC_DIR}/${GCC_DIR}/configure \
-    --prefix=${INSTALL_DIR} \
-    --program-prefix=${PROGRAM_PREFIX} \
-    --target=${TARGET} \
-    --enable-lto \
-    --enable-languages=c,c++ \
-    --with-arch=m68k \
-    --with-cpu=${WITH_CPU} \
-    --with-newlib \
-    --enable-interwork \
-    --enable-multilib \
-    --disable-shared \
-    --disable-threads \
-
-make -j${NUM_PROC} 2<&1 | tee build.gcc-stage2.1.log
-make install 2<&1 | tee build.gcc-stage2.2.log
-make -j${NUM_PROC} all-target-libgcc 2<&1 | tee build.gcc-stage2.3.log
-make install-target-libgcc 2<&1 | tee build.gcc-stage2.4.log
-
-cd ${ROOT_DIR}
-```
+build_m68k-toolchain.sh
+build_x68k-libgcc.sh
+x68k_gcc_has_converter.pl
+には、Apache License Version 2.0 が適用されます。
 
 
