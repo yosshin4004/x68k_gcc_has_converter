@@ -80,11 +80,21 @@ then
 	echo "	build_x68k-libgcc.sh [options]"
 	echo ""
 	echo "	options:"
-	echo "		-old-libgcc <filename>"
-	echo "			specify an old libgcc.a file for X68K gcc."
+	echo "		-m68000"
+	echo "			generate libgcc.a for m68000."
 	echo ""
-	echo "	example:"
-	echo "		build_x68k-libgcc.sh -old-libgcc G295b04D/libgcc.a"
+	echo "		-m68020"
+	echo "			generate libgcc.a for m68020."
+	echo ""
+	echo "		-m68040"
+	echo "			generate libgcc.a for m68040."
+	echo ""
+	echo "		-m68060"
+	echo "			generate libgcc.a for m68060."
+	echo ""
+	echo "		--reuse-old-libgcc <filename>"
+	echo "			Extract lb1sf68 objs from the specified libgcc.a file,"
+	echo "			instead of assembling them from lb1sf68.S."
 	echo ""
 	exit 1
 fi
@@ -96,10 +106,23 @@ declare -A OPTIONS
 while [ $# -gt 0 ]
 do
 	case $1 in
-		-old-libgcc)
-			if [ -n "${OPTIONS[$OPTION]}" ]; then
-				echo "ERROR: option $1 is duplicated."
-			fi
+		-m68000)
+			OPTION=$1;
+			OPTIONS[$OPTION]="1"
+			;;
+		-m68020)
+			OPTION=$1;
+			OPTIONS[$OPTION]="1"
+			;;
+		-m68040)
+			OPTION=$1;
+			OPTIONS[$OPTION]="1"
+			;;
+		-m68060)
+			OPTION=$1;
+			OPTIONS[$OPTION]="1"
+			;;
+		--reuse-old-libgcc)
 			OPTION=$1;
 			OPTIONS[$OPTION]=""
 			;;
@@ -118,14 +141,14 @@ do
 	shift
 done
 
-# 必須の引数が指定されていないならエラー
-if [ ! -n "${OPTIONS["-old-libgcc"]}" ] || [ "${OPTIONS["-old-libgcc"]}" = "" ]; then
-	echo "ERROR: please specify -old-libgcc option."
-	exit 1
-fi
+# オプション指定一覧
+#for OPTION in ${!OPTIONS[@]}
+#do
+#	echo "	${OPTION}=${OPTIONS[${OPTION}]}"
+#done
 
-# 旧 libgcc.a ファイルの指定
-OLD_LIBGCC_FILE_NAME=${OPTIONS["-old-libgcc"]}
+# 旧 libgcc.a ファイルの再利用指定
+OLD_LIBGCC_FILE_NAME=${OPTIONS["--reuse-old-libgcc"]}
 
 
 #-----------------------------------------------------------------------------
@@ -137,7 +160,26 @@ OLD_LIBGCC_FILE_NAME=${OPTIONS["-old-libgcc"]}
 set -eu
 
 # ターゲットとする CPU の型番
-TARGETS=(68000 68020 68040 68060)
+TARGETS=()
+if [ -n "${OPTIONS["-m68000"]-}" ]; then
+	TARGETS+=(68000)
+fi
+if [ -n "${OPTIONS["-m68020"]-}" ]; then
+	TARGETS+=(68020)
+fi
+if [ -n "${OPTIONS["-m68040"]-}" ]; then
+	TARGETS+=(68040)
+fi
+if [ -n "${OPTIONS["-m68060"]-}" ]; then
+	TARGETS+=(68060)
+fi
+
+# ターゲット一覧の確認
+#for TARGET in ${TARGETS[@]}
+#do
+#	echo "	TARGET $TARGET"
+#done
+
 
 # gcc の ABI 名（X68K のパス名として使える文字列で表現）
 GCC_ABI_IN_X68K=`echo $GCC_ABI | sed -e "s/-/_/g"`
@@ -174,21 +216,23 @@ then
 	exit 0
 fi
 
-# 旧 libgcc.a ファイルが存在しないならエラー
-if [ ! -e ${OLD_LIBGCC_FILE_NAME} ];
-then
-	echo "ERROR: '${OLD_LIBGCC_FILE_NAME}' is not found."
-	exit 0
-fi
-
-
 # libgcc ビルド用ワークディレクトリを作成
 mkdir ${LIBGCC_BUILD_DIR}
 mkdir ${LIBGCC_BUILD_DIR}/src
 mkdir ${LIBGCC_BUILD_DIR}/lib
 
-# 旧 libgcc.a をワークディレクトリの src 以下にコピー
-cp ${OLD_LIBGCC_FILE_NAME} ${LIBGCC_BUILD_DIR}/src/libgcc.a
+# 旧 libgcc.a ファイルの再利用が指定されている場合
+if [ -n "${OPTIONS["--reuse-old-libgcc"]-}" ]; then
+	# 旧 libgcc.a ファイルが存在するなら
+	if [ -e ${OLD_LIBGCC_FILE_NAME} ]; then
+		# 旧 libgcc.a をワークディレクトリの src 以下にコピー
+		cp ${OLD_LIBGCC_FILE_NAME} ${LIBGCC_BUILD_DIR}/src/libgcc.a
+	else
+		# エラー
+		echo "ERROR: '${OLD_LIBGCC_FILE_NAME}' is not found."
+		exit 0
+	fi
+fi
 
 
 #-----------------------------------------------------------------------------
@@ -208,10 +252,59 @@ do
 	# ディレクトリ生成
 	mkdir -p ${LIBGCC_TARGET_SRC_DIR}
 	mkdir -p ${LIBGCC_TARGET_LIB_DIR}
+	mkdir -p ${LIBGCC_TARGET_SRC_DIR}/dep
 
 
 	#-----------------------------------------------------------------------------
-	# libgcc2.c からオブジェクトファイル群を生成
+	# lb1sf68.S から HAS 形式のソースファイル群を生成する
+	#-----------------------------------------------------------------------------
+
+	# lb1sf68.S から生成するオブジェクトファイル名
+	#	[オブジェクトファイル名]=ソースファイル名
+	#	X68K のファイル名規則に違反する場合はここでリネームする。
+	declare -A SRC_FILES_EMIT_FROM_LB1SF68
+	# 旧 libgcc.a ファイルの再利用が指定されていない場合のみ有効
+	if [ ! -n "${OPTIONS["--reuse-old-libgcc"]-}" ]; then
+		SRC_FILES_EMIT_FROM_LB1SF68=(
+			[_mulsi3]=_mulsi3
+			[_udivsi3]=_udivsi3
+			[_divsi3]=_divsi3
+			[_umodsi3]=_umodsi3
+			[_modsi3]=_modsi3
+			[_double]=_double
+			[_float]=_float
+			[_floatex]=_floatex
+			[_eqdf2]=_eqdf2
+			[_nedf2]=_nedf2
+			[_gtdf2]=_gtdf2
+			[_gedf2]=_gedf2
+			[_ltdf2]=_ltdf2
+			[_ledf2]=_ledf2
+			[_eqsf2]=_eqsf2
+			[_nesf2]=_nesf2
+			[_gtsf2]=_gtsf2
+			[_gesf2]=_gesf2
+			[_ltsf2]=_ltsf2
+			[_lesf2]=_lesf2
+		)
+	fi
+
+	# lb1sf68.S をプリプロセスして得られたソースファイルを HAS 形式に変換
+	for OBJ in ${!SRC_FILES_EMIT_FROM_LB1SF68[@]}
+	do
+		SRC=${SRC_FILES_EMIT_FROM_LB1SF68[$OBJ]}
+		echo "	generating ${OBJ}.s from lb1sf68.S."
+		${M68K_TOOLCHAIN}/bin/${GCC_ABI}-cpp -E -DL${OBJ} -o ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s ${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/config/m68k/lb1sf68.S
+		${GAS_TO_HAS} -i ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s -o ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.s -cpu ${TARGET}
+		rm ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s
+	done
+
+	# 依存ファイルを収集
+	cp ${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/config/m68k/lb1sf68.S ${LIBGCC_TARGET_SRC_DIR}/dep
+
+
+	#-----------------------------------------------------------------------------
+	# libgcc2.c からソースファイル群を生成
 	#-----------------------------------------------------------------------------
 
 	# コンパイルオプション
@@ -323,35 +416,37 @@ do
 		[_udiv_w_sdiv]=_udiv_w_sdiv
 	)
 
-	# libgcc2.c からオブジェクトを生成する
+	# libgcc2.c からソースファイルを生成する
 	for OBJ in ${!SRC_FILES_EMIT_FROM_LIBGCC2[@]}
 	do
 		SRC=${SRC_FILES_EMIT_FROM_LIBGCC2[$OBJ]}
-		echo "	generating ${OBJ}.o"
+		echo "	generating ${OBJ}.s from libgcc2.c."
 		${M68K_TOOLCHAIN}/bin/${GCC_ABI}-gcc ${CFLAGS} -S -o ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s -DL${SRC} -c ${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/libgcc2.c
 		${GAS_TO_HAS} -i ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s -o ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.s -cpu ${TARGET} -inline-asm-syntax gas
 		rm ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s
+
+		# 依存ファイルを収集
+		${M68K_TOOLCHAIN}/bin/${GCC_ABI}-gcc ${CFLAGS} -c -M ${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/libgcc2.c -MF ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.d
+		DEP_FILES=(`cat ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.d`)
+		for DEP_FILE in ${DEP_FILES[@]}
+		do
+			if [ -e ${DEP_FILE} ]; then
+				cp ${DEP_FILE} ${LIBGCC_TARGET_SRC_DIR}/dep
+			fi
+		done
+		rm ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.d
 	done
 
 
 	#-----------------------------------------------------------------------------
-	# 拡張倍精度ビルトイン関数のオブジェクトファイル生成
+	# その他のソースファイル群を生成
 	#-----------------------------------------------------------------------------
 
+	# _xfgnulib.c を生成する
 	echo '#define EXTFLOAT' > ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib.c
 	cat ${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/config/m68k/fpgnulib.c >> ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib.c
 
-	echo "	generating _xfgnulib.o"
-	${M68K_TOOLCHAIN}/bin/${GCC_ABI}-gcc ${CFLAGS} -S -o ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib_.s -c ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib.c
-	${GAS_TO_HAS} -i ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib_.s -o ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib.s -cpu ${TARGET} -inline-asm-syntax gas
-	rm ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib_.s
-
-
-	#-----------------------------------------------------------------------------
-	# その他のオブジェクトファイル群を生成
-	#-----------------------------------------------------------------------------
-
-	# libgcc2.c から生成しないオブジェクトファイル名
+	# libgcc2.c 以外のファイルから生成するオブジェクトファイル名
 	#	[オブジェクトファイル名]=ソースファイル名
 	#	X68K のファイル名規則に違反する場合はここでリネームする。
 	#	明らかに不要なもの（デバッグ情報に関連する unwind～）はコメントアウトした。
@@ -366,14 +461,30 @@ do
 #		[_unwind_c]=${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/unwind-c
 		[_emutls]=${GCC_BUILD_DIR}/src/gcc-${GCC_VERSION}/libgcc/emutls
 	)
+
+	# libgcc2.c 以外のファイルに由来するソースファイルを生成する
 	for OBJ in ${!SRC_FILES_EMIT_NOT_FROM_LIBGCC2[@]}
 	do
 		SRC=${SRC_FILES_EMIT_NOT_FROM_LIBGCC2[$OBJ]}
-		echo "	generating ${OBJ}.o"
+		echo "	generating ${OBJ}.s from ${SRC}.c."
 		${M68K_TOOLCHAIN}/bin/${GCC_ABI}-gcc ${CFLAGS} -S -o ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s -c ${SRC}.c
 		${GAS_TO_HAS} -i ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s -o ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.s -cpu ${TARGET} -inline-asm-syntax gas
 		rm ${LIBGCC_TARGET_SRC_DIR}/${OBJ}_.s
+
+		# 依存ファイルを収集
+		${M68K_TOOLCHAIN}/bin/${GCC_ABI}-gcc ${CFLAGS} -c -M ${SRC}.c -MF ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.d
+		DEP_FILES=(`cat ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.d`)
+		for DEP_FILE in ${DEP_FILES[@]}
+		do
+			if [ -e ${DEP_FILE} ]; then
+				cp ${DEP_FILE} ${LIBGCC_TARGET_SRC_DIR}/dep
+			fi
+		done
+		rm ${LIBGCC_TARGET_SRC_DIR}/${OBJ}.d
 	done
+
+	# _xfgnulib.c を除去する
+	rm ${LIBGCC_TARGET_SRC_DIR}/_xfgnulib.c
 
 
 	#-----------------------------------------------------------------------------
@@ -381,66 +492,82 @@ do
 	#-----------------------------------------------------------------------------
 	BAT_FILE=${LIBGCC_TARGET_SRC_DIR}/build.bat
 	rm -f ${BAT_FILE}
+	printf "echo off\r\n" >> ${BAT_FILE}
 
 	# 旧 libgcc.a ファイル（X68K 上でのパス）
 	OLD_LIBGCC_FILE_NAME_FOR_X68K=..\\\\..\\\\libgcc.a
 
-	# 旧 libgcc.a ファイルが存在することを確認
-	printf "echo off\r\n" >> ${BAT_FILE}
-	printf "\r\n" >> ${BAT_FILE}
-	printf "if NOT EXIST ${OLD_LIBGCC_FILE_NAME_FOR_X68K} goto ERROR_NO_OLD_LIBGCC_A\r\n" >> ${BAT_FILE}
-	printf "\r\n" >> ${BAT_FILE}
+	# 旧 libgcc.a ファイルの再利用が指定されている場合
+	if [ -n "${OPTIONS["--reuse-old-libgcc"]-}" ]; then
+		# 旧 libgcc.a ファイルが存在することを確認
+		printf "\r\n" >> ${BAT_FILE}
+		printf "if NOT EXIST ${OLD_LIBGCC_FILE_NAME_FOR_X68K} goto ERROR_NO_OLD_LIBGCC_A\r\n" >> ${BAT_FILE}
+		printf "\r\n" >> ${BAT_FILE}
+	fi
 
+	# lb1sf68.S から生成されたソースファイルのアセンブル
+	for OBJ in ${!SRC_FILES_EMIT_FROM_LB1SF68[@]}
+	do
+		printf "has060.x -e -u -w0 -m ${TARGET} ${OBJ}.s\r\n" >> ${BAT_FILE}
+		printf "if EXITCODE 1 goto ERROR_HAS060_FAILED\r\n" >> ${BAT_FILE}
+	done
+
+	# libgcc2.c から生成されたソースファイルのアセンブル
 	for OBJ in ${!SRC_FILES_EMIT_FROM_LIBGCC2[@]}
 	do
 		printf "has060.x -e -u -w0 -m ${TARGET} ${OBJ}.s\r\n" >> ${BAT_FILE}
 		printf "if EXITCODE 1 goto ERROR_HAS060_FAILED\r\n" >> ${BAT_FILE}
 	done
 
+	# libgcc2.c 以外から生成されたソースファイルのアセンブル
 	for OBJ in ${!SRC_FILES_EMIT_NOT_FROM_LIBGCC2[@]}
 	do
 		printf "has060.x -e -u -w0 -m ${TARGET} ${OBJ}.s\r\n" >> ${BAT_FILE}
 		printf "if EXITCODE 1 goto ERROR_HAS060_FAILED\r\n" >> ${BAT_FILE}
 	done
 
-	# 合成して、新たな libgcc.a を生成する
+	# 旧 libgcc.a から再利用可能なオブジェクトファイル名
 	#	[コピー先オブジェクトファイル名]=コピー元オブジェクトファイル名
 	declare -A OBJ_FILES_COPY_FROM_X68K_LIBGCC
-	OBJ_FILES_COPY_FROM_X68K_LIBGCC=(
-		[_adddf3]=_adddf3
-		[_divsf3]=_divsf3
-		[_gesf2]=_gesf2
-		[_ltdf2]=_ltdf2
-		[_mulsi3]=_mulsi3
-		[_subdf3]=_subdf3
-		[_addsf3]=_addsf3
-		[_divsi3]=_divsi3
-		[_gtdf2]=_gtdf2
-		[_ltsf2]=_ltsf2
-		[_nedf2]=_nedf2
-		[_subsf3]=_subsf3
-		[_cmpdf2]=_cmpdf2
-		[_eqdf2]=_eqdf2
-		[_gtsf2]=_gtsf2
-		[_modsi3]=_modsi3
-		[_negdf2]=_negdf2
-		[_udivsi3]=_udivsi3
-		[_cmpsf2]=_cmpsf2
-		[_eqsf2]=_eqsf2
-		[_ledf2]=_ledf2
-		[_muldf3]=_muldf3
-		[_negsf2]=_negsf2
-		[_umodsi3]=_umodsi3
-		[_divdf3]=_divdf3
-		[_gedf2]=_gedf2
-		[_lesf2]=_lesf2
-		[_mulsf3]=_mulsf3
-		[_nesf2]=_nesf2
-	)
+	# 旧 libgcc.a ファイルの再利用が指定されている場合のみ有効
+	if [ -n "${OPTIONS["--reuse-old-libgcc"]-}" ]; then
+		OBJ_FILES_COPY_FROM_X68K_LIBGCC=(
+			[_adddf3]=_adddf3
+			[_divsf3]=_divsf3
+			[_gesf2]=_gesf2
+			[_ltdf2]=_ltdf2
+			[_mulsi3]=_mulsi3
+			[_subdf3]=_subdf3
+			[_addsf3]=_addsf3
+			[_divsi3]=_divsi3
+			[_gtdf2]=_gtdf2
+			[_ltsf2]=_ltsf2
+			[_nedf2]=_nedf2
+			[_subsf3]=_subsf3
+			[_cmpdf2]=_cmpdf2
+			[_eqdf2]=_eqdf2
+			[_gtsf2]=_gtsf2
+			[_modsi3]=_modsi3
+			[_negdf2]=_negdf2
+			[_udivsi3]=_udivsi3
+			[_cmpsf2]=_cmpsf2
+			[_eqsf2]=_eqsf2
+			[_ledf2]=_ledf2
+			[_muldf3]=_muldf3
+			[_negsf2]=_negsf2
+			[_umodsi3]=_umodsi3
+			[_divdf3]=_divdf3
+			[_gedf2]=_gedf2
+			[_lesf2]=_lesf2
+			[_mulsf3]=_mulsf3
+			[_nesf2]=_nesf2
+		)
+	fi
 
 	# アーカイブにファイルを追記するのに先だって古いアーカイブを削除
 	printf "if EXIST libgcc.a del libgcc.a\r\n" >> ${BAT_FILE}
 
+	# 旧 libgcc.a からオブジェクトファイルを取り出し
 	for SRC in ${!OBJ_FILES_COPY_FROM_X68K_LIBGCC[@]}
 	do
 		DST=${OBJ_FILES_COPY_FROM_X68K_LIBGCC[$SRC]}
@@ -450,18 +577,28 @@ do
 		printf "if EXITCODE 1 goto ERROR_AR_FAILED\r\n" >> ${BAT_FILE}
 	done
 
+	# lb1sf68.S から生成されたオブジェクトファイルをアーカイブ
+	for OBJ in ${!SRC_FILES_EMIT_FROM_LB1SF68[@]}
+	do
+		printf "ar.x /u libgcc.a ${OBJ}.o\r\n" >> ${BAT_FILE}
+		printf "if EXITCODE 1 goto ERROR_AR_FAILED\r\n" >> ${BAT_FILE}
+	done
+
+	# libgcc2.c から生成されたオブジェクトファイルをアーカイブ
 	for OBJ in ${!SRC_FILES_EMIT_FROM_LIBGCC2[@]}
 	do
 		printf "ar.x /u libgcc.a ${OBJ}.o\r\n" >> ${BAT_FILE}
 		printf "if EXITCODE 1 goto ERROR_AR_FAILED\r\n" >> ${BAT_FILE}
 	done
 
+	# libgcc2.c 以外から生成されたオブジェクトファイルをアーカイブ
 	for OBJ in ${!SRC_FILES_EMIT_NOT_FROM_LIBGCC2[@]}
 	do
 		printf "ar.x /u libgcc.a ${OBJ}.o\r\n" >> ${BAT_FILE}
 		printf "if EXITCODE 1 goto ERROR_AR_FAILED\r\n" >> ${BAT_FILE}
 	done
 
+	# 旧 libgcc.a から取り出したオブジェクトファイルをアーカイブ
 	for DST in ${!OBJ_FILES_COPY_FROM_X68K_LIBGCC[@]}
 	do
 		printf "ar.x /u libgcc.a ${DST}.o\r\n" >> ${BAT_FILE}
@@ -481,12 +618,14 @@ do
 	printf "pause\r\n" >> ${BAT_FILE}
 	printf "goto END\r\n" >> ${BAT_FILE}
 	printf "\r\n" >> ${BAT_FILE}
-	printf ":ERROR_NO_OLD_LIBGCC_A\r\n" >> ${BAT_FILE}
-	printf "echo !!!ERROR!!!\r\n" >> ${BAT_FILE}
-	printf "echo ${OLD_LIBGCC_FILE_NAME_FOR_X68K} is not found.\r\n" >> ${BAT_FILE}
-	printf "echo Please copy old libgcc.a (extracted from G295b04D.ZIP) to ${OLD_LIBGCC_FILE_NAME_FOR_X68K}\r\n" >> ${BAT_FILE}
-	printf "pause\r\n" >> ${BAT_FILE}
-	printf "\r\n" >> ${BAT_FILE}
+	if [ -n "${OPTIONS["--reuse-old-libgcc"]-}" ]; then
+		printf ":ERROR_NO_OLD_LIBGCC_A\r\n" >> ${BAT_FILE}
+		printf "echo !!!ERROR!!!\r\n" >> ${BAT_FILE}
+		printf "echo ${OLD_LIBGCC_FILE_NAME_FOR_X68K} is not found.\r\n" >> ${BAT_FILE}
+		printf "echo Please copy old libgcc.a (extracted from G295b04D.ZIP) to ${OLD_LIBGCC_FILE_NAME_FOR_X68K}\r\n" >> ${BAT_FILE}
+		printf "pause\r\n" >> ${BAT_FILE}
+		printf "\r\n" >> ${BAT_FILE}
+	fi
 	printf ":ERROR_HAS060_FAILED\r\n" >> ${BAT_FILE}
 	printf "echo !!!ERROR!!!\r\n" >> ${BAT_FILE}
 	printf "echo HAS060.X failed.\r\n" >> ${BAT_FILE}
@@ -558,6 +697,18 @@ printf "\r\n" >> ${BAT_FILE}
 printf ":END\r\n" >> ${BAT_FILE}
 
 
+#-----------------------------------------------------------------------------
+# ソースコードパッケージの作成
+#-----------------------------------------------------------------------------
+ROOT_DIR="${PWD}"
+cd ${LIBGCC_BUILD_DIR}
+tar -zcvf src.tar.gz src/ all.bat
+cd ${ROOT_DIR}
+
+
+#-----------------------------------------------------------------------------
+# 次の操作を促す
+#-----------------------------------------------------------------------------
 echo "done."
 echo ""
 echo "-----------------------------------------------------------------------------"
@@ -566,4 +717,5 @@ echo "    1) Copy ${LIBGCC_BUILD_DIR}/ to X68K."
 echo "    2) Move current directory to ${LIBGCC_BUILD_DIR}/ and run all.bat on X68K."
 echo "-----------------------------------------------------------------------------"
 echo ""
+
 

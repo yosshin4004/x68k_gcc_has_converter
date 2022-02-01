@@ -50,8 +50,8 @@ HAS.X -e -u -w0 -o example.o example.s
 ```
 カレントディレクトリに example.o が得られます。
 
-これを実行ファイルに変換するには、m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式の libgcc.a をリンクする必要があります。
-（このような libgcc.a の生成手順は後述します。）
+これを実行ファイルに変換するには、
+本リポジトリに含まれている libgcc.a（m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式）をリンクする必要があります。
 ```bat
 rem example.o は、既存の X68K のソフトウェア資産とリンク可能。
 rem CLIB.L FLOATFNC.L は sharp XC コンパイラに含まれるライブラリである。
@@ -148,10 +148,34 @@ __length_code:                                          *_length_code:
         .dc.b $1b,$1b,$1b,$1b,$1b,$1b,$1b,$1c           *       .ascii  "\033\033\033\033\033\033\033\034"
 ```
 
+gas 形式（右）では、MIT syntax と呼ばれる記法が利用されることがあります。
+HAS.X 形式（左）では Motorola syntax に変換されます。
+```
+									* .type __mulsi3,function
+ .globl ___mulsi3					* .globl __mulsi3
+___mulsi3:							*__mulsi3:
+ move.w 4(sp),d0					* movew %sp@(4), %d0
+ mulu.w 10(sp),d0					* muluw %sp@(10), %d0
+ move.w 6(sp),d1					* movew %sp@(6), %d1
+ mulu.w 8(sp),d1					* muluw %sp@(8), %d1
+									*
+ add.w d1,d0						* addw %d1, %d0
+									*
+									*
+									*
+ swap d0							* swap %d0
+ clr.w d0							* clrw %d0
+ move.w 6(sp),d1					* movew %sp@(6), %d1
+ mulu.w 10(sp),d1					* muluw %sp@(10), %d1
+ add.l d1,d0						* addl %d1, %d0
+									*
+ rts								* rts
+```
+
 
 # libgcc.a の種類と用途
 
-libgcc.a は、用途に応じて複数の種類から選択して利用可能です。
+libgcc.a は、複数の種類から用途に応じて選択して利用可能です。
 
 * m68k_elf/m68000/libgcc.a  
 	MC68000 の命令セットで構成されています。
@@ -169,7 +193,7 @@ libgcc.a は、用途に応じて複数の種類から選択して利用可能�
 	MC68040 の命令セットで構成されています。
 	040Turbo 等のアクセラレータを搭載した X680x0 で動作可能な実行ファイルを作成する場合にリンクします。
 
-* m68k_elf/m68040/libgcc.a  
+* m68k_elf/m68060/libgcc.a  
 	MC68060 の命令セットで構成されています。
 	060Turbo 等のアクセラレータを搭載した X680x0 で動作可能な実行ファイルを作成する場合にリンクします。
 
@@ -202,7 +226,7 @@ libgcc.a は、用途に応じて複数の種類から選択して利用可能�
 	>Linux のディストリビューターが提供している m68k-linux-gnu-gcc などのビルド済み gcc は、
 	>戻り値を a0 d0 双方に同一の値を返す動作になっており、X68K の ABI と互換性がありません。
 
-## 2. 一部の数値型のバイナリ表現が異なる（回避策は無いが影響を受ける可能性は低い）
+## 2. 一部の数値型のバイナリ表現が異なる（回避策は無いが、影響を受けるソフトウェア資産はほとんど存在しない）
 従来の X68K 対応コンパイラと m68k-elf-gcc との間で、一部の数値型のバイナリ表現が異なります。
 
 * long double 型（拡張倍精度浮動小数型）  
@@ -222,16 +246,43 @@ long long 型の場合は根本的に異なるため回避困難です。
 問題となる状況はほとんど発生しないと考えられます。
 
 
+## 3. NaN Inf 互換性問題
+最新の m68k-elf-gcc では、NaN や Inf のバイナリ表現は一般的なコンパイラ上での扱いと同様です。
+一方 X68K の古いソフトウェア資産上では、NaN や Inf 等を扱うコードが、フルスペックの実装になってない場合があります。
+これが原因で、最新の m68k-elf-gcc が出力した NaN や Inf 等が、古いソフトウェア資産上で正しく機能しない場合があります。
+
+この問題の再現例を示します。
+まず、従来の X68K 対応コンパイラ（古い X68K 移植版 gcc）で NaN Inf を発生させ、X68000 上で printf した結果を示します。
+```
+Inf (1.0f/0.0f を計算させて生成)
+	バイナリ表現      : 0x7FFFFFFF
+	printf による出力 : #NAN.000000
+NaN (0.0f/0.0f を計算させて生成)
+	バイナリ表現      : 0x7FFFFFFF
+	printf による出力 : #NAN.000000 
+```
+次に、最新の m68k-elf-gcc 上で NaN Inf を発生させ、X68000 上で printf した結果を示します。
+```
+Inf (1.0f/0.0f を計算させて生成)
+	バイナリ表現      : 0x7F800000（IEEE754 の Inf としては正しい）
+	printf による出力 : 340282366920940000000000000000000000000.000000（正しくない）
+NaN (0.0f/0.0f を計算させて生成)
+	バイナリ表現      : 0xFFFFFFFF（IEEE754 の NaN としては正しい）
+	printf による出力 : -680564693277060000000000000000000000000.000000（正しくない）
+```
+後者では NaN Inf が正しく表示されていません。
+
+
 # 推奨される利用スタイル
 
 以上を踏まえて、
 gcc の互換性問題を回避しつつ、
 m68k-elf-gcc を活用したコードを記述する、現状の最善の方法をまとめます。
 
-1. ビルド構成が不明な gcc を利用せず、自力ビルドした gcc を利用する
-2. m68k-elf-gcc 側に -fcall-used-d2 -fcall-used-a2 を指定する
-3. m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式の libgcc.a を利用する
-4. 過去のバイナリ資産を再利用する場合は、long long 型、long double 型 を含まないものに限る
+1. ビルド構成が不明な gcc を利用せず、自力ビルドした m68k-elf-gcc を利用する。
+2. m68k-elf-gcc 側に -fcall-used-d2 -fcall-used-a2 を指定する。
+3. 本リポジトリに含まれている libgcc.a（m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式）を利用する。
+4. 過去のバイナリ資産を再利用する場合は、long long 型、long double 型 を含まないものに限る。NaN や Inf は扱わない。
 
 
 # m68k-elf-gcc の作成手順
@@ -252,27 +303,20 @@ build_m68k-toolchain.sh
 
 # libgcc.a の作成手順
 
-m68k-elf-gcc 対応かつ X68K オブジェクトファイル形式の libgcc.a を作成するには、
+libgcc.a は本リポジトリに含まれているのでユーザーの手で作成する必要はありません。
+もし、何らかの事情で作成しなおす必要がある場合は、
 先述の build_m68k-toolchain.sh が実行完了し、
 bulid_gcc/ 以下に中間ファイルが存在する状態で、
 以下の手順を実行します。
 
-1. 旧 libgcc.a の入手  
-X68K 移植版 GCC 2.95.2 (by KQ 氏) の G295b04D.ZIP を入手し、
-アーカイブに含まれている旧 libgcc.a を取り出します。
-
-2. build_x68k-libgcc.sh の実行  
-build_x68k-libgcc.sh の置かれているディレクトリ上に 旧 libgcc.a をコピーし、
-build_x68k-libgcc.sh -old-libgcc ./libgcc.a
+1. build_x68k-libgcc.sh の実行  
+build_x68k-libgcc.sh -m68000 -m68020 -m68040 -m68060  
 を実行します。
-（一部の関数は旧 libgcc.a から流用し、それら以外は新しい libgcc のソースから再コンパイルして生成されます。）
 
-3. X68K 上でアセンブル＆リンク  
+2. X68K 上でアセンブル＆リンク  
 ディレクトリ build_libgcc/ を X68K 上にコピーし、
-X68K 上で build_libgcc/src/m68k_elf を実行します。
-
-4. 必要なファイルのインストール  
-build_libgcc/lib/m68k_elf 以下に、ビルド結果が生成されます。お好みのパスに移動して利用してください。
+X68K 上で build_libgcc/all.bat を実行します。
+build_libgcc/lib/m68k_elf 以下に、ビルド結果が生成されます。
 
 ディレクトリ build_libgcc/ は中間ファイルです。
 ここまでの手順が完了したら削除しても問題ありません。
@@ -286,7 +330,7 @@ build_libgcc/lib/m68k_elf 以下に、ビルド結果が生成されます。お
 	本コンバート・ツールが認識できるのは、GAS 形式アセンブラコードの記述方法のうち、gcc が出力する可能性のあるもののみです。
 
 * inline asm 内に記述可能なアセンブラコードの制限  
-	マクロ制御命令（HAS の macro local endm exitm rept irp irpc など）は利用できません。
+	マクロ制御命令（HAS の macro local endm exitm rept irp irpc など）は、全く対応していないか、全ての仕様に対応していません。
 	特殊記号（HAS の '&' '!' , '<'～'>' , '%' など）が出現するとパースエラーになります。
 
 
@@ -304,9 +348,11 @@ build_libgcc/lib/m68k_elf 以下に、ビルド結果が生成されます。お
 
 # ライセンス
 
-build_m68k-toolchain.sh
-build_x68k-libgcc.sh
-x68k_gcc_has_converter.pl
-には、Apache License Version 2.0 が適用されます。
+* build_m68k-toolchain.sh / build_x68k-libgcc.sh / x68k_gcc_has_converter.pl  
+Apache License Version 2.0 が適用されます。
 
+* libgcc/ 以下  
+GNU GENERAL PUBLIC LICENSE Version 3 と、GCC RUNTIME LIBRARY EXCEPTION Version 3.1 が適用されます。
+（libgcc.a をバイナリ単体で配布するときは GPL 適用になるため、ソースコードまたはその入手手段を開示する必要がある。
+libgcc.a をアプリケーションにリンクして利用する場合は、アプリケーションに GPL は伝搬しないし、ソース開示などの義務は生じない。）
 
